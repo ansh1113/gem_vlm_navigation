@@ -1,250 +1,213 @@
 #!/usr/bin/env python3
 """
-planner_node.py — VLM Path Planning + PACMod Control Node for GEM e4
-======================================================================
-Drop-in replacement for pure_pursuit_ros2.py.
+planner_node.py — Receding-Horizon Path Planner + PACMod Controller
+====================================================================
+Subscribes to /vlm_waypoints (PoseArray from vlm_node).
+On each new waypoint list: IMMEDIATELY preempts current plan,
+runs A* from current position to waypoint[0] on live costmap,
+and begins tracking. Advances through waypoint list as each
+is reached. When list is exhausted and VLM hasn't replied yet:
+enters CREEP mode (0.5 m/s, hold heading).
 
-Replaces:  CSV waypoint source + fixed pure pursuit loop
-With:      VLM goal → A* planner → smoothed path → pure pursuit → PACMod
-
-The low-level PACMod interface is IDENTICAL to pure_pursuit_ros2.py:
-  - Same publishers, same message types, same topic names
-  - Same joystick enable/disable logic (LB+RB to enable, LB alone to disable)
-  - Same front2steer() steering wheel angle conversion
-  - Same PID speed controller with Butterworth speed filter
-  - Same INSNavGeod heading conversion formula
+Low-level output is IDENTICAL to pure_pursuit_ros2.py:
+  - Same PACMod topics and message types
+  - Same joystick enable/disable (LB+RB / LB)
+  - Same front2steer() polynomial conversion
+  - Same PID speed controller + Butterworth speed filter
+  - Same INSNavGeod heading conversion
 
 Topics (in):
-  /navsatfix                  — Septentrio GNSS position
-  /insnavgeod                 — Septentrio INS heading (degrees)
-  /ouster/points              — Ouster OS1-128 LiDAR pointcloud
-  /pacmod/enabled             — PACMod enable status
-  /pacmod/vehicle_speed_rpt   — Measured vehicle speed
-  /vlm_goal                   — PoseStamped ENU goal from perception_node
+  /vlm_waypoints             — PoseArray from vlm_node
+  /vlm_costmap               — OccupancyGrid from lidar_bev_node
+  /vlm_status                — String status from vlm_node
+  /navsatfix                 — Septentrio GNSS
+  /insnavgeod                — Septentrio INS heading
+  /pacmod/enabled            — PACMod enable status
+  /pacmod/vehicle_speed_rpt  — Measured vehicle speed
 
 Topics (out):  [identical to pure_pursuit_ros2.py]
-  /pacmod/global_cmd          — Enable/disable PACMod
-  /pacmod/shift_cmd           — Gear (DRIVE=3)
-  /pacmod/steering_cmd        — Steering wheel angle + rate
-  /pacmod/accel_cmd           — Throttle [0, max_accel]
-  /pacmod/brake_cmd           — Brake [0, 1]
-  /pacmod/turn_cmd            — Turn signal
+  /pacmod/global_cmd
+  /pacmod/shift_cmd
+  /pacmod/steering_cmd
+  /pacmod/accel_cmd
+  /pacmod/brake_cmd
+  /pacmod/turn_cmd
 
-Visualization (optional, view in RViz):
-  /vlm_path                   — nav_msgs/Path of planned waypoints
-  /vlm_costmap                — nav_msgs/OccupancyGrid live obstacle map
+Visualization:
+  /vlm_current_path          — nav_msgs/Path of current A* path (RViz)
 """
 
-import os
 import math
 import heapq
-
 import numpy as np
 import scipy.ndimage as ndimage
 import scipy.signal as signal
 from scipy.interpolate import splprep, splev
 import pymap3d as pm
 import pygame
+from visualization_msgs.msg import Marker, MarkerArray
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
-from std_msgs.msg import Bool
-from sensor_msgs.msg import NavSatFix, PointCloud2
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path, OccupancyGrid
-import sensor_msgs_py.point_cloud2 as pc2
-
-# PACMod messages — same as pure_pursuit_ros2.py
+from std_msgs.msg import Bool, String
+from sensor_msgs.msg import NavSatFix
+from geometry_msgs.msg import PoseArray, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Path
 from pacmod2_msgs.msg import (
-    PositionWithSpeed,
-    VehicleSpeedRpt,
-    GlobalCmd,
-    SystemCmdFloat,
-    SystemCmdInt,
+    PositionWithSpeed, VehicleSpeedRpt,
+    GlobalCmd, SystemCmdFloat, SystemCmdInt,
 )
 from septentrio_gnss_driver.msg import INSNavGeod
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION  (mirrors pure_pursuit_ros2.py parameter defaults)
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-# ENU origin — must match perception_node and pure pursuit controller
-ORIGIN_LAT  = 40.0927422
-ORIGIN_LON  = -88.2359639
+ORIGIN_LAT = 40.0927422
+ORIGIN_LON = -88.2359639
 
-# Highbay operating area (meters ENU)
 X_MIN, X_MAX = -25.0, 75.0
 Y_MIN, Y_MAX =  -5.0, 20.0
 
-# Occupancy grid
-RESOLUTION  = 0.5    # m/cell
-INFLATE_R   = 1.5    # obstacle inflation radius (m); 3 cells @ 0.5m
+RESOLUTION  = 0.5    # m/cell — must match lidar_bev_node
+INFLATE_R   = 1.5    # m — car half-width + safety margin
 
-# LiDAR height filter
-LIDAR_Z_MIN =  0.1   # m — ignore ground returns
-LIDAR_Z_MAX =  2.5   # m — ignore ceiling / overhead structure
+# Pure pursuit (matches pure_pursuit_ros2.py defaults)
+LOOK_AHEAD    = 5.0
+WHEELBASE     = 2.57
+OFFSET        = 1.26   # GNSS antenna to rear axle
+DESIRED_SPEED = 2.0
+MAX_ACCEL     = 0.5
+MAX_STEER_RAD = 0.6
 
-# Pure pursuit (mirrors pure_pursuit_ros2.py defaults)
-LOOK_AHEAD   = 5.0   # m base lookahead (same as 'look_ahead' parameter)
-WHEELBASE    = 2.57  # m
-OFFSET       = 1.26  # m — GNSS antenna offset from rear axle (same as original)
-DESIRED_SPEED = 2.0  # m/s (capped at 5.0 in original)
-MAX_ACCEL    = 0.5   # throttle limit (capped at 2.0 in original)
-GOAL_TOL     = 1.5   # m — arrival tolerance
+# Creep mode
+CREEP_SPEED   = 0.5    # m/s when waiting for next VLM plan
+CREEP_TIMEOUT = 15.0   # s — full stop if no VLM update for this long
 
-# PID speed controller (same defaults as pure_pursuit_ros2.py)
-PID_KP = 0.6
-PID_KI = 0.0
-PID_KD = 0.1
-PID_WG = 10.0
+WP_TOL        = 1.8    # m — waypoint arrival tolerance
+GOAL_TOL      = 1.5    # m — final goal tolerance
 
-# Speed filter (Butterworth low-pass, same as original)
-FILTER_CUTOFF = 1.2
-FILTER_FS     = 30
-FILTER_ORDER  = 4
+# PID (same as pure_pursuit_ros2.py)
+PID_KP, PID_KI, PID_KD, PID_WG = 0.6, 0.0, 0.1, 10.0
+FILTER_CUTOFF, FILTER_FS, FILTER_ORDER = 1.2, 30, 4
 
-# Steering wheel angle conversion constants (front2steer, same as original)
-STEER_A = -0.1084   # quadratic coefficient
-STEER_B = 21.775    # linear coefficient
-STEER_MAX_DEG = 35  # max front wheel angle (degrees)
+# front2steer polynomial (same as pure_pursuit_ros2.py)
+STEER_A       = -0.1084
+STEER_B       = 21.775
+STEER_MAX_DEG = 35
 
-# PACMod gear commands
-GEAR_NEUTRAL = 2
-GEAR_DRIVE   = 3
+GEAR_NEUTRAL  = 2
+GEAR_DRIVE    = 3
+CONTROL_HZ    = 20
 
 
 # ═══════════════════════════════════════════════════════════════
-#  UTILITIES
+#  HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-def ins_heading_to_yaw(heading_deg: float) -> float:
-    """
-    Convert Septentrio heading (0=North, CW, degrees) to ENU yaw
-    (0=East, CCW, radians). Exact copy of heading_to_yaw() in
-    pure_pursuit_ros2.py.
-    """
-    if heading_deg < 270.0:
-        return math.radians(90.0 - heading_deg)
-    else:
-        return math.radians(450.0 - heading_deg)
+def ins_heading_to_yaw(h: float) -> float:
+    return math.radians(90.0 - h) if h < 270.0 else math.radians(450.0 - h)
 
 def normalize_angle(a: float) -> float:
-    while a >  math.pi: a -= 2.0 * math.pi
-    while a < -math.pi: a += 2.0 * math.pi
+    while a >  math.pi: a -= 2 * math.pi
+    while a < -math.pi: a += 2 * math.pi
     return a
 
 def world_to_cell(x, y):
     return int((x - X_MIN) / RESOLUTION), int((y - Y_MIN) / RESOLUTION)
 
-def cell_to_world(col, row):
-    return (X_MIN + (col + 0.5) * RESOLUTION,
-            Y_MIN + (row + 0.5) * RESOLUTION)
+def cell_to_world(c, r):
+    return X_MIN + (c + 0.5) * RESOLUTION, Y_MIN + (r + 0.5) * RESOLUTION
 
-def in_bounds(col, row, shape):
-    return 0 <= row < shape[0] and 0 <= col < shape[1]
+def in_bounds(c, r, shape):
+    return 0 <= r < shape[0] and 0 <= c < shape[1]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PID CONTROLLER  (copied verbatim from pure_pursuit_ros2.py)
+#  PID + FILTER  (verbatim from pure_pursuit_ros2.py)
 # ═══════════════════════════════════════════════════════════════
 
 class PID:
     def __init__(self, kp, ki, kd, wg=None):
-        self.kp = kp; self.ki = ki; self.kd = kd; self.wg = wg
-        self.iterm = 0; self.last_e = 0; self.last_t = None
+        self.kp=kp; self.ki=ki; self.kd=kd; self.wg=wg
+        self.iterm=0; self.last_e=0; self.last_t=None
 
     def reset(self):
-        self.iterm = 0; self.last_e = 0; self.last_t = None
+        self.iterm=0; self.last_e=0; self.last_t=None
 
     def get_control(self, t, e):
         if self.last_t is None:
             dt = de = 0.0
         else:
             dt = t - self.last_t
-            de = (e - self.last_e) / dt if dt > 0.0 else 0.0
+            de = (e - self.last_e) / dt if dt > 0 else 0.0
         self.iterm += e * dt
-        if self.wg is not None:
+        if self.wg:
             self.iterm = max(min(self.iterm, self.wg), -self.wg)
-        self.last_e = e
-        self.last_t = t
+        self.last_e = e; self.last_t = t
         return self.kp * e + self.ki * self.iterm + self.kd * de
 
-
-# ═══════════════════════════════════════════════════════════════
-#  BUTTERWORTH SPEED FILTER  (copied verbatim from pure_pursuit_ros2.py)
-# ═══════════════════════════════════════════════════════════════
 
 class OnlineFilter:
     def __init__(self, cutoff, fs, order):
         nyq = 0.5 * fs
-        normal_cutoff = cutoff / nyq
-        self.b, self.a = signal.butter(
-            order, normal_cutoff, btype='low', analog=False)
+        self.b, self.a = signal.butter(order, cutoff / nyq, btype='low', analog=False)
         self.z = signal.lfilter_zi(self.b, self.a)
 
-    def get_data(self, data):
-        filted, self.z = signal.lfilter(self.b, self.a, [data], zi=self.z)
-        return filted[0]
+    def get_data(self, v):
+        out, self.z = signal.lfilter(self.b, self.a, [v], zi=self.z)
+        return out[0]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  OCCUPANCY GRID
+#  GRID + A*
 # ═══════════════════════════════════════════════════════════════
 
-def build_base_grid() -> np.ndarray:
-    """Grid pre-filled with 1m boundary walls so A* never plans outside lot."""
-    nc   = int(np.ceil((X_MAX - X_MIN) / RESOLUTION))
-    nr   = int(np.ceil((Y_MAX - Y_MIN) / RESOLUTION))
-    grid = np.zeros((nr, nc), dtype=np.uint8)
-    w    = max(1, int(1.0 / RESOLUTION))
-    grid[:w, :] = grid[-w:, :] = grid[:, :w] = grid[:, -w:] = 1
-    return grid
+def build_base_grid():
+    nc = int(np.ceil((X_MAX - X_MIN) / RESOLUTION))
+    nr = int(np.ceil((Y_MAX - Y_MIN) / RESOLUTION))
+    g  = np.zeros((nr, nc), dtype=np.uint8)
+    w  = max(1, int(1.0 / RESOLUTION))
+    g[:w, :] = g[-w:, :] = g[:, :w] = g[:, -w:] = 1
+    return g
 
-def build_inflated_grid(grid: np.ndarray, radius_m: float) -> np.ndarray:
-    """Circular inflation — ensures paths clear obstacles by at least radius_m."""
-    r      = max(1, int(radius_m / RESOLUTION))
-    struct = np.zeros((2*r+1, 2*r+1), dtype=bool)
+def inflate_grid(grid, r_m):
+    r = max(1, int(r_m / RESOLUTION))
+    s = np.zeros((2*r+1, 2*r+1), dtype=bool)
     for i in range(2*r+1):
         for j in range(2*r+1):
-            if (i - r)**2 + (j - r)**2 <= r**2:
-                struct[i, j] = True
-    return ndimage.binary_dilation(
-        grid.astype(bool), structure=struct).astype(np.uint8)
+            if (i-r)**2 + (j-r)**2 <= r**2:
+                s[i, j] = True
+    return ndimage.binary_dilation(grid.astype(bool), structure=s).astype(np.uint8)
 
+def astar(grid, sw, gw):
+    sc = world_to_cell(*sw)
+    gc = world_to_cell(*gw)
 
-# ═══════════════════════════════════════════════════════════════
-#  A* PATH PLANNER
-# ═══════════════════════════════════════════════════════════════
-
-def astar(grid: np.ndarray, start_w: tuple, goal_w: tuple):
-    sc = world_to_cell(*start_w)
-    gc = world_to_cell(*goal_w)
-
-    def snap_free(col, row):
-        if in_bounds(col, row, grid.shape) and grid[row, col] == 0:
-            return col, row
-        for r in range(1, 15):
-            for dc in range(-r, r+1):
-                for dr in range(-r, r+1):
-                    nc2, nr2 = col+dc, row+dr
+    def snap(c, r):
+        if in_bounds(c, r, grid.shape) and grid[r, c] == 0:
+            return c, r
+        for rd in range(1, 15):
+            for dc in range(-rd, rd+1):
+                for dr in range(-rd, rd+1):
+                    nc2, nr2 = c+dc, r+dr
                     if in_bounds(nc2, nr2, grid.shape) and grid[nr2, nc2] == 0:
                         return nc2, nr2
-        return col, row
+        return c, r
 
-    sc = snap_free(*sc)
-    gc = snap_free(*gc)
+    sc = snap(*sc)
+    gc = snap(*gc)
     if not in_bounds(*sc, grid.shape) or not in_bounds(*gc, grid.shape):
         return None
 
     nbrs = [(1,0,1.0),(-1,0,1.0),(0,1,1.0),(0,-1,1.0),
             (1,1,1.414),(1,-1,1.414),(-1,1,1.414),(-1,-1,1.414)]
-    heap   = []
-    heapq.heappush(heap, (0.0, sc))
-    came   = {}
-    gscore = {sc: 0.0}
+    heap = [(0.0, sc)]
+    came = {}
+    gs   = {sc: 0.0}
 
     while heap:
         _, cur = heapq.heappop(heap)
@@ -256,28 +219,27 @@ def astar(grid: np.ndarray, start_w: tuple, goal_w: tuple):
             path.append(cell_to_world(*sc))
             path.reverse()
             return path
-        col, row = cur
+        c, r = cur
         for dc, dr, cost in nbrs:
-            nb = (col+dc, row+dr)
+            nb = (c+dc, r+dr)
             if not in_bounds(nb[0], nb[1], grid.shape): continue
-            if grid[nb[1], nb[0]] == 1:               continue
-            t = gscore[cur] + cost
-            if t < gscore.get(nb, float('inf')):
-                came[nb]   = cur
-                gscore[nb] = t
-                heapq.heappush(heap,
-                    (t + math.hypot(nb[0]-gc[0], nb[1]-gc[1]), nb))
+            if grid[nb[1], nb[0]] == 1: continue
+            t = gs[cur] + cost
+            if t < gs.get(nb, 1e9):
+                came[nb] = cur
+                gs[nb]   = t
+                heapq.heappush(heap, (t + math.hypot(nb[0]-gc[0], nb[1]-gc[1]), nb))
     return None
 
-def smooth_path(path, n_points: int = 200):
-    if path is None or len(path) < 3: return path
+def smooth_path(path, n=200):
+    if not path or len(path) < 3: return path
     pts = np.array(path)
     _, idx = np.unique(pts, axis=0, return_index=True)
     pts = pts[np.sort(idx)]
     if len(pts) < 3: return path
     try:
-        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=2.0, k=min(3, len(pts)-1))
-        xs, ys = splev(np.linspace(0, 1, n_points), tck)
+        tck, _ = splprep([pts[:,0], pts[:,1]], s=2.0, k=min(3, len(pts)-1))
+        xs, ys = splev(np.linspace(0, 1, n), tck)
         return list(zip(xs.tolist(), ys.tolist()))
     except Exception:
         return path
@@ -287,409 +249,412 @@ def smooth_path(path, n_points: int = 200):
 #  PLANNER NODE
 # ═══════════════════════════════════════════════════════════════
 
-class VLMPlannerNode(Node):
+class PlannerNode(Node):
     def __init__(self):
         super().__init__('vlm_planner_node')
 
-        # ── Joystick (same init as pure_pursuit_ros2.py) ───────
+        # ── Joystick ───────────────────────────────────────────
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
-            self.get_logger().warn(
-                "No joystick detected — vehicle enable/disable will not work!")
-            self._joystick = None
+            self.get_logger().warn("No joystick — vehicle enable won't work!")
+            self._joy = None
         else:
-            self._joystick = pygame.joystick.Joystick(0)
-            self._joystick.init()
-            self.get_logger().info("Joystick ready.")
+            self._joy = pygame.joystick.Joystick(0)
+            self._joy.init()
 
-        # ── Speed controller (same as pure_pursuit_ros2.py) ────
-        self.pid_speed   = PID(PID_KP, PID_KI, PID_KD, wg=PID_WG)
-        self.speed_filter = OnlineFilter(FILTER_CUTOFF, FILTER_FS, FILTER_ORDER)
+        # ── Speed controller ───────────────────────────────────
+        self.pid  = PID(PID_KP, PID_KI, PID_KD, wg=PID_WG)
+        self.filt = OnlineFilter(FILTER_CUTOFF, FILTER_FS, FILTER_ORDER)
 
         # ── Vehicle state ──────────────────────────────────────
-        self.lat          = 0.0
-        self.lon          = 0.0
-        self.heading      = 0.0   # raw degrees from INSNavGeod (same as PP)
-        self.speed        = 0.0   # filtered m/s from VehicleSpeedRpt
+        self.lat = self.lon = 0.0
+        self.heading      = 0.0
+        self.speed        = 0.0
+        self.car_x        = None
+        self.car_y        = None
+        self.car_yaw      = 0.0
         self.pacmod_enable = False
 
-        # Car ENU position + yaw (derived from lat/lon/heading)
-        self.car_x   = None
-        self.car_y   = None
-        self.car_yaw = 0.0
+        # ── Mission state ──────────────────────────────────────
+        self.wp_queue     = []      # list of (x,y) from VLM
+        self.wp_idx       = 0       # which waypoint we're heading to
+        self.path         = None    # current A* smoothed path
+        self.path_idx     = 0
+        self.mode         = 'idle'  # idle | navigating | creep | arrived
+        self.vlm_status   = 'waiting'
+        self.last_wp_time = 0.0
 
-        # ── Planning state ─────────────────────────────────────
-        self.global_path = None
-        self.target_idx  = 0
+        # ── Grid ───────────────────────────────────────────────
+        self.grid = build_base_grid()
+        self.car_marker_pub  = self.create_publisher(Marker, '/vlm_car_marker', 10)
+        self.goal_marker_pub = self.create_publisher(MarkerArray, '/vlm_goal_markers', 10)
 
-        # ── Occupancy grid ─────────────────────────────────────
-        self.base_grid = build_base_grid()
-        self.grid      = self.base_grid.copy()
-
-        # ── PACMod command objects (same as pure_pursuit_ros2.py) ─
+        # ── PACMod command objects ─────────────────────────────
         self.global_cmd = GlobalCmd(enable=False, clear_override=True)
         self.gear_cmd   = SystemCmdInt(command=GEAR_NEUTRAL)
         self.brake_cmd  = SystemCmdFloat(command=0.0)
         self.accel_cmd  = SystemCmdFloat(command=0.0)
-        self.turn_cmd   = SystemCmdInt(command=1)   # no turn signal
+        self.turn_cmd   = SystemCmdInt(command=1)
         self.steer_cmd  = PositionWithSpeed(
             angular_position=0.0, angular_velocity_limit=4.0)
 
         # ── Subscriptions ──────────────────────────────────────
-        self.create_subscription(NavSatFix, '/navsatfix',         self.gnss_cb,   10)
-        self.create_subscription(INSNavGeod, '/insnavgeod',       self.ins_cb,    10)
-        self.create_subscription(Bool, '/pacmod/enabled',         self.enable_cb, 10)
-        self.create_subscription(VehicleSpeedRpt,
-                                 '/pacmod/vehicle_speed_rpt',     self.speed_cb,  10)
-        self.create_subscription(PointCloud2, '/ouster/points',   self.lidar_cb,  10)
+        self.create_subscription(NavSatFix,       '/navsatfix',               self.gps_cb,    10)
+        self.create_subscription(INSNavGeod,      '/insnavgeod',              self.ins_cb,    10)
+        self.create_subscription(Bool,            '/pacmod/enabled',          self.enable_cb, 10)
+        self.create_subscription(VehicleSpeedRpt, '/pacmod/vehicle_speed_rpt',self.speed_cb,  10)
+        self.create_subscription(OccupancyGrid,   '/vlm_costmap',             self.costmap_cb,10)
+        self.create_subscription(String,          '/vlm_status',              self.status_cb, 10)
 
-        # Goal from perception node — TRANSIENT_LOCAL so we don't miss it
-        qos = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(PoseStamped, '/vlm_goal', self.goal_cb, qos)
+        wp_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(PoseArray, '/vlm_waypoints', self.waypoints_cb, wp_qos)
 
-        # ── PACMod publishers (same topics/types as pure_pursuit_ros2.py) ─
-        self.global_pub = self.create_publisher(GlobalCmd,         '/pacmod/global_cmd',   10)
-        self.gear_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/shift_cmd',    10)
-        self.brake_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/brake_cmd',    10)
-        self.accel_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/accel_cmd',    10)
-        self.turn_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/turn_cmd',     10)
-        self.steer_pub  = self.create_publisher(PositionWithSpeed, '/pacmod/steering_cmd', 10)
+        # ── PACMod publishers ──────────────────────────────────
+        self.global_pub = self.create_publisher(GlobalCmd,         '/pacmod/global_cmd',    10)
+        self.gear_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/shift_cmd',     10)
+        self.brake_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/brake_cmd',     10)
+        self.accel_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/accel_cmd',     10)
+        self.turn_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/turn_cmd',      10)
+        self.steer_pub  = self.create_publisher(PositionWithSpeed, '/pacmod/steering_cmd',  10)
+        self.path_pub   = self.create_publisher(Path,              '/vlm_current_path',     10)
 
-        # ── Visualization publishers (RViz) ────────────────────
-        self.path_pub = self.create_publisher(Path,         '/vlm_path',    10)
-        self.grid_pub = self.create_publisher(OccupancyGrid, '/vlm_costmap', 10)
-
-        # ── Control timer (20 Hz — same as pure_pursuit_ros2.py) ─
-        self.create_timer(1.0 / 20.0, self.control_loop)
-
-        self.get_logger().info(
-            "VLM Planner ready. "
-            "Waiting for /vlm_goal — use joystick LB+RB to enable vehicle.")
+        self.create_timer(1.0 / CONTROL_HZ, self.control_loop)
+        self.get_logger().info("VLM Planner ready. Joystick LB+RB to enable.")
 
     # ══════════════════════════════════════════════════════════
     #  SENSOR CALLBACKS
     # ══════════════════════════════════════════════════════════
 
-    def gnss_cb(self, msg: NavSatFix):
-        """Store raw lat/lon — same as gnss_callback in pure_pursuit_ros2.py."""
+    def gps_cb(self, msg):
         self.lat = msg.latitude
         self.lon = msg.longitude
-        # Also update ENU position for planner use
         try:
             e, n, _ = pm.geodetic2enu(
                 self.lat, self.lon, 0, ORIGIN_LAT, ORIGIN_LON, 0)
-            self.car_x = float(e)
-            self.car_y = float(n)
+            self.car_x, self.car_y = float(e), float(n)
         except Exception:
             pass
 
-    def ins_cb(self, msg: INSNavGeod):
-        """
-        Store raw heading degrees — same as ins_callback in pure_pursuit_ros2.py.
-        Also compute ENU yaw for planner.
-        """
+    def ins_cb(self, msg):
         self.heading = msg.heading
         if msg.heading is not None and not math.isnan(msg.heading):
             self.car_yaw = ins_heading_to_yaw(msg.heading)
 
-    def speed_cb(self, msg: VehicleSpeedRpt):
-        """Filtered speed — same as speed_callback in pure_pursuit_ros2.py."""
-        self.speed = self.speed_filter.get_data(msg.vehicle_speed)
+    def speed_cb(self, msg):
+        self.speed = self.filt.get_data(msg.vehicle_speed)
 
-    def enable_cb(self, msg: Bool):
-        """PACMod enable status — same as enable_callback in pure_pursuit_ros2.py."""
+    def enable_cb(self, msg):
         self.pacmod_enable = msg.data
 
-    def lidar_cb(self, msg: PointCloud2):
-        """
-        Build dynamic occupancy grid from LiDAR scan.
-        Transform points from Ouster sensor frame to ENU map frame
-        using current GNSS position + INS heading.
-        """
-        if self.car_x is None:
-            return
+    def status_cb(self, msg):
+        self.vlm_status = msg.data
+        if msg.data == 'arrived':
+            self.mode = 'arrived'
 
-        pts_list = list(pc2.read_points(
-            msg, field_names=("x", "y", "z"), skip_nans=True))
-        if not pts_list:
-            return
-
-        points = np.array(
-            [[p[0], p[1], p[2]] for p in pts_list], dtype=np.float32)
-        points = points[~np.isnan(points).any(axis=1)]
-        if len(points) == 0:
-            return
-
-        # Height filter — remove ground + ceiling
-        obs = points[(points[:, 2] > LIDAR_Z_MIN) & (points[:, 2] < LIDAR_Z_MAX)]
-
-        # Clear inner grid — keep boundary walls
-        wall = max(1, int(1.0 / RESOLUTION))
-        self.grid[wall:-wall, wall:-wall] = 0
-
-        # Rotate sensor-frame points to ENU map frame
-        cos_y = math.cos(self.car_yaw)
-        sin_y = math.sin(self.car_yaw)
-        for p in obs:
-            map_x = self.car_x + p[0] * cos_y - p[1] * sin_y
-            map_y = self.car_y + p[0] * sin_y + p[1] * cos_y
-            if math.isnan(map_x) or math.isnan(map_y):
-                continue
-            col, row = world_to_cell(map_x, map_y)
-            if in_bounds(col, row, self.grid.shape):
-                self.grid[row, col] = 1
-
-        self._publish_grid()
+    def costmap_cb(self, msg: OccupancyGrid):
+        """Receive live costmap from lidar_bev_node and rebuild grid."""
+        nr   = msg.info.height
+        nc   = msg.info.width
+        data = np.array(msg.data, dtype=np.int8).reshape(nr, nc)
+        self.grid = (data > 50).astype(np.uint8)
 
     # ══════════════════════════════════════════════════════════
-    #  GOAL CALLBACK — runs A* when perception sends a new goal
+    #  WAYPOINT CALLBACK — preempt and replan
     # ══════════════════════════════════════════════════════════
 
-    def goal_cb(self, msg: PoseStamped):
-        gx = msg.pose.position.x
-        gy = msg.pose.position.y
-
-        if math.isnan(gx) or math.isnan(gy):
-            self.get_logger().error("Received NaN goal — ignoring.")
+    def waypoints_cb(self, msg: PoseArray):
+        if not msg.poses:
             return
         if self.car_x is None:
-            self.get_logger().warn("Goal received but GPS not ready yet.")
+            self.get_logger().warn("Waypoints received but GPS not ready.")
             return
 
+        new_wps = [(p.position.x, p.position.y) for p in msg.poses]
         self.get_logger().info(
-            f"Goal received: ({gx:.2f}, {gy:.2f}) ENU. Running A*...")
+            f"VLM waypoints ({len(new_wps)}): "
+            + "  ".join(f"({x:.1f},{y:.1f})" for x, y in new_wps))
 
-        inflated = build_inflated_grid(self.grid, INFLATE_R)
-        raw      = astar(inflated, (self.car_x, self.car_y), (gx, gy))
+        # Preempt current plan immediately
+        self.wp_queue     = new_wps
+        self.wp_idx       = 0
+        self.last_wp_time = self.get_clock().now().nanoseconds * 1e-9
+        self.mode         = 'navigating'
+
+        self._plan_to_current_wp()
+
+    def _plan_to_current_wp(self):
+        """Run A* to wp_queue[wp_idx]."""
+        if self.wp_idx >= len(self.wp_queue) or self.car_x is None:
+            return
+
+        target   = self.wp_queue[self.wp_idx]
+        inf_grid = inflate_grid(self.grid, INFLATE_R)
+        raw      = astar(inf_grid, (self.car_x, self.car_y), target)
 
         if raw is None:
             self.get_logger().error(
-                "A* found no path. Check goal is inside lot bounds "
-                "and not blocked by obstacles.")
+                f"A* failed to WP{self.wp_idx} ({target[0]:.1f},{target[1]:.1f}). "
+                "Entering creep mode.")
+            self.mode = 'creep'
             return
 
-        self.global_path = smooth_path(raw)
-        self.target_idx  = 0
+        self.path     = smooth_path(raw)
+        self.path_idx = 0
+        self._publish_path_viz()
         self.get_logger().info(
-            f"Path ready: {len(raw)} raw → {len(self.global_path)} smoothed pts.")
-
-        self._publish_path()
+            f"A* to WP{self.wp_idx} ({target[0]:.1f},{target[1]:.1f}): "
+            f"{len(self.path)} smoothed pts.")
 
     # ══════════════════════════════════════════════════════════
-    #  CONTROL LOOP  (20 Hz — same rate as pure_pursuit_ros2.py)
+    #  CONTROL LOOP  (20 Hz)
     # ══════════════════════════════════════════════════════════
 
     def control_loop(self):
-        """
-        Mirrors the control_loop structure of pure_pursuit_ros2.py exactly:
-          - Check joystick enable/disable
-          - If enabled and path exists: run pure pursuit + PID speed
-          - Publish to same PACMod topics
-        """
+        self._publish_dashboard_markers()
         joy = self._check_joystick()
 
-        # ── Joystick ENABLE (LB + RB) ─────────────────────────
+        # ── Joystick ENABLE ───────────────────────────────────
         if joy == 1 and not self.pacmod_enable:
-            self.global_cmd.enable      = True
+            self.global_cmd.enable = True
             self.global_cmd.clear_override = True
             self.global_pub.publish(self.global_cmd)
-
             self.gear_cmd.command = GEAR_DRIVE
             self.gear_pub.publish(self.gear_cmd)
-
-            self.brake_cmd.command = 0.0
-            self.brake_pub.publish(self.brake_cmd)
-
-            self.accel_cmd.command = 0.0
-            self.accel_pub.publish(self.accel_cmd)
-
-            self.turn_cmd.command = 3   # no signal
-            self.turn_pub.publish(self.turn_cmd)
-
-            self.get_logger().warn(
-                'Pacmod Disabled: Vehicle enabled and forward gear engaged')
+            self.brake_cmd.command = 0.0; self.brake_pub.publish(self.brake_cmd)
+            self.accel_cmd.command = 0.0; self.accel_pub.publish(self.accel_cmd)
+            self.turn_cmd.command  = 3;   self.turn_pub.publish(self.turn_cmd)
+            self.get_logger().warn('PACMod enabled, DRIVE gear engaged')
             return
 
-        # ── Joystick DISABLE (LB only) ────────────────────────
+        # ── Joystick DISABLE ──────────────────────────────────
         if joy == 0 and self.pacmod_enable:
             self.global_cmd.enable = False
             self.global_pub.publish(self.global_cmd)
-
-            self.turn_cmd.command = 1
-            self.turn_pub.publish(self.turn_cmd)
-
-            self.get_logger().warn('Joystick Disabled: Vehicle disabled')
+            self.turn_cmd.command = 1; self.turn_pub.publish(self.turn_cmd)
+            self.get_logger().warn('PACMod disabled by joystick')
             return
 
-        # ── Execute controller ────────────────────────────────
+        # ── Execute ───────────────────────────────────────────
         if joy != 0 and self.pacmod_enable:
-            # No path yet — hold still
-            if self.global_path is None or self.car_x is None:
+            if self.car_x is None:
                 return
 
-            # ── Get current vehicle state (same as get_gem_state) ─
-            local_x, local_y = self._wps_to_local_xy(self.lon, self.lat)
+            if self.mode == 'arrived':
+                self.get_logger().info("Mission complete.", once=True)
+                self._stop()
+                return
+
+            if self.mode == 'idle':
+                return
+
+            # ── Check waypoint arrival ─────────────────────────
+            if self.wp_queue and self.wp_idx < len(self.wp_queue):
+                twx, twy = self.wp_queue[self.wp_idx]
+                if math.hypot(self.car_x - twx, self.car_y - twy) < WP_TOL:
+                    self.wp_idx += 1
+                    if self.wp_idx < len(self.wp_queue):
+                        self.get_logger().info(
+                            f"WP{self.wp_idx-1} reached → replanning to WP{self.wp_idx}")
+                        self._plan_to_current_wp()
+                    else:
+                        self.get_logger().info(
+                            "All waypoints reached → CREEP mode (waiting for VLM)")
+                        self.mode = 'creep'
+
+            # ── Creep + timeout ────────────────────────────────
+            if self.mode == 'creep':
+                now = self.get_clock().now().nanoseconds * 1e-9
+                if now - self.last_wp_time > CREEP_TIMEOUT:
+                    self.get_logger().warn(
+                        f"No VLM update in {CREEP_TIMEOUT}s → full stop")
+                    self._stop()
+                    return
+                self._execute_creep()
+                return
+
+            # ── Normal navigation ──────────────────────────────
+            if self.path is None:
+                return
+
+            # Vehicle state with antenna offset (same as pure_pursuit_ros2.py)
+            lx, ly   = self._gps_to_local(self.lon, self.lat)
             curr_yaw = ins_heading_to_yaw(self.heading)
-            # Correct for antenna offset (same as pure_pursuit_ros2.py)
-            curr_x = local_x - OFFSET * math.cos(curr_yaw)
-            curr_y = local_y - OFFSET * math.sin(curr_yaw)
+            curr_x   = lx - OFFSET * math.cos(curr_yaw)
+            curr_y   = ly - OFFSET * math.sin(curr_yaw)
 
-            # ── Goal reached check ─────────────────────────────
-            gx, gy = self.global_path[-1]
-            if math.hypot(curr_x - gx, curr_y - gy) < GOAL_TOL:
-                self.get_logger().info("Goal reached! Stopping.")
-                self._stop_vehicle()
-                self.global_path = None
-                return
-
-            # ── Pure pursuit steering ──────────────────────────
-            px = np.array([p[0] for p in self.global_path])
-            py = np.array([p[1] for p in self.global_path])
-            n  = len(self.global_path)
-
-            # Distance array to all waypoints
-            dist_arr = np.hypot(px - curr_x, py - curr_y)
-
-            # Find closest waypoint, then advance by lookahead
-            # (mirrors the original goal-finding loop exactly)
-            closest = int(np.argmin(dist_arr))
-            ld = LOOK_AHEAD + max(0.0, self.speed - 2.5) * 2.0
-            goal_idx = closest
-            for i in range(closest, n):
-                if dist_arr[i] > ld:
-                    goal_idx = i
-                    break
-            goal_idx = min(goal_idx, n - 1)
-
-            tx  = px[goal_idx]
-            ty  = py[goal_idx]
-
-            alpha     = math.atan2(ty - curr_y, tx - curr_x) - curr_yaw
-            alpha     = normalize_angle(alpha)
-            curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
-            front_angle_deg = math.degrees(math.atan(WHEELBASE * curvature))
-
-            # Convert front wheel angle → steering wheel angle
-            # (front2steer from pure_pursuit_ros2.py)
-            steer_wheel_deg = self._front2steer(front_angle_deg)
-            steer_wheel_rad = math.radians(steer_wheel_deg)
-
-            self.steer_cmd.angular_position = steer_wheel_rad
+            # Steering
+            steer_deg = self._pure_pursuit(curr_x, curr_y, curr_yaw)
+            self.steer_cmd.angular_position = math.radians(steer_deg)
             self.steer_pub.publish(self.steer_cmd)
 
-            # ── PID speed control (same as pure_pursuit_ros2.py) ─
-            now         = self.get_clock().now().nanoseconds * 1e-9
-            speed_err   = DESIRED_SPEED - self.speed
-            if abs(speed_err) < 0.05:
-                speed_err = 0.0
-            throttle    = self.pid_speed.get_control(now, speed_err)
-            throttle    = max(0.0, min(throttle, MAX_ACCEL))
-
+            # Speed PID
+            now       = self.get_clock().now().nanoseconds * 1e-9
+            speed_err = DESIRED_SPEED - self.speed
+            if abs(speed_err) < 0.05: speed_err = 0.0
+            throttle  = max(0.0, min(self.pid.get_control(now, speed_err), MAX_ACCEL))
             self.accel_cmd.command = throttle
             self.brake_cmd.command = 0.0
             self.accel_pub.publish(self.accel_cmd)
             self.brake_pub.publish(self.brake_cmd)
-
             self.global_cmd.enable = True
             self.global_pub.publish(self.global_cmd)
 
-            self.get_logger().info(
-                f"Pos: ({curr_x:.2f}, {curr_y:.2f})  "
-                f"Target: ({tx:.2f}, {ty:.2f})  "
-                f"Speed: {self.speed:.2f}  "
-                f"Throttle: {throttle:.2f}  "
-                f"Steer: {steer_wheel_deg:.2f}°  "
-                f"Dist→Goal: {math.hypot(curr_x-gx, curr_y-gy):.1f}m")
+            # Log
+            if self.path_idx % 20 == 0 and self.wp_queue:
+                twx, twy = self.wp_queue[min(self.wp_idx, len(self.wp_queue)-1)]
+                self.get_logger().info(
+                    f"({curr_x:.1f},{curr_y:.1f}) → WP{self.wp_idx}"
+                    f"({twx:.1f},{twy:.1f}) "
+                    f"dist:{math.hypot(curr_x-twx,curr_y-twy):.1f}m "
+                    f"spd:{self.speed:.2f} thr:{throttle:.2f} "
+                    f"steer:{steer_deg:.1f}° [{self.mode}/{self.vlm_status}]")
 
     # ══════════════════════════════════════════════════════════
-    #  HELPERS  (copied / adapted from pure_pursuit_ros2.py)
+    #  HELPERS
     # ══════════════════════════════════════════════════════════
+
+    def _pure_pursuit(self, cx, cy, cyaw) -> float:
+        """
+        Pure pursuit. Returns steering WHEEL angle in degrees.
+        Mirrors control logic of pure_pursuit_ros2.py exactly.
+        """
+        px = np.array([p[0] for p in self.path])
+        py = np.array([p[1] for p in self.path])
+        n  = len(self.path)
+
+        dist_arr = np.hypot(px - cx, py - cy)
+        closest  = int(np.argmin(dist_arr))
+        ld       = LOOK_AHEAD + max(0.0, self.speed - 2.5) * 2.0
+
+        goal_idx = closest
+        for i in range(closest, n):
+            if dist_arr[i] > ld:
+                goal_idx = i
+                break
+        self.path_idx = min(goal_idx, n - 1)
+
+        tx = px[self.path_idx]
+        ty = py[self.path_idx]
+
+        alpha     = math.atan2(ty - cy, tx - cx) - cyaw
+        alpha     = normalize_angle(alpha)
+        curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
+        front_deg = math.degrees(math.atan(WHEELBASE * curvature))
+
+        return self._front2steer(front_deg)
+
+    def _execute_creep(self):
+        """Hold heading, drive at CREEP_SPEED while waiting for VLM."""
+        self.steer_cmd.angular_position = 0.0
+        self.steer_pub.publish(self.steer_cmd)
+        now      = self.get_clock().now().nanoseconds * 1e-9
+        throttle = max(0.0, min(
+            self.pid.get_control(now, CREEP_SPEED - self.speed), MAX_ACCEL))
+        self.accel_cmd.command = throttle
+        self.brake_cmd.command = 0.0
+        self.accel_pub.publish(self.accel_cmd)
+        self.brake_pub.publish(self.brake_cmd)
+        self.global_cmd.enable = True
+        self.global_pub.publish(self.global_cmd)
+
+    def _stop(self):
+        self.accel_cmd.command = 0.0; self.accel_pub.publish(self.accel_cmd)
+        self.brake_cmd.command = 0.3; self.brake_pub.publish(self.brake_cmd)
+        self.global_cmd.enable = False; self.global_pub.publish(self.global_cmd)
+        self.turn_cmd.command  = 1;    self.turn_pub.publish(self.turn_cmd)
 
     def _check_joystick(self) -> int:
-        """
-        Mirrors check_joystick_enable() from pure_pursuit_ros2.py.
-        Returns: 1=enable, 0=disable, 2=no change
-        """
-        if self._joystick is None:
-            return 2
+        if self._joy is None: return 2
         pygame.event.pump()
         try:
-            lb = self._joystick.get_button(6)
-            rb = self._joystick.get_button(7)
+            lb = self._joy.get_button(6)
+            rb = self._joy.get_button(7)
         except pygame.error:
-            self.get_logger().warn("Joystick read failed.")
             return 2
-        if lb and rb:
-            return 1   # enable
-        if lb and not rb:
-            return 0   # disable
-        return 2       # no change
+        if lb and rb:      return 1
+        if lb and not rb:  return 0
+        return 2
 
-    def _front2steer(self, f_angle: float) -> float:
-        """
-        Convert front wheel angle (degrees) to steering wheel angle (degrees).
-        Exact copy of front2steer() from pure_pursuit_ros2.py.
-        """
-        f_angle = max(min(f_angle, STEER_MAX_DEG), -STEER_MAX_DEG)
-        angle   = abs(f_angle)
-        steer   = STEER_A * angle**2 + STEER_B * angle
-        return round(steer if f_angle >= 0 else -steer, 2)
+    def _front2steer(self, f_deg: float) -> float:
+        """Exact copy of front2steer() from pure_pursuit_ros2.py."""
+        f_deg = max(min(f_deg, STEER_MAX_DEG), -STEER_MAX_DEG)
+        a     = abs(f_deg)
+        s     = STEER_A * a**2 + STEER_B * a
+        return round(s if f_deg >= 0 else -s, 2)
 
-    def _wps_to_local_xy(self, lon: float, lat: float) -> tuple:
-        """
-        GPS → local ENU.
-        Mirrors wps_to_local_xy() from pure_pursuit_ros2.py.
-        """
+    def _gps_to_local(self, lon, lat):
         x, y, _ = pm.geodetic2enu(lat, lon, 0, ORIGIN_LAT, ORIGIN_LON, 0)
         return float(x), float(y)
 
-    def _stop_vehicle(self):
-        """Send zero throttle + disable PACMod cleanly."""
-        self.accel_cmd.command = 0.0
-        self.brake_cmd.command = 0.3   # light brake to hold position
-        self.accel_pub.publish(self.accel_cmd)
-        self.brake_pub.publish(self.brake_cmd)
-        self.global_cmd.enable = False
-        self.global_pub.publish(self.global_cmd)
-        self.turn_cmd.command = 1
-        self.turn_pub.publish(self.turn_cmd)
-
-    # ── Visualization ──────────────────────────────────────────
-
-    def _publish_path(self):
+    def _publish_path_viz(self):
+        if not self.path: return
         msg = Path()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        for wp in self.global_path:
+        for wp in self.path:
             ps = PoseStamped()
             ps.header             = msg.header
             ps.pose.position.x    = float(wp[0])
             ps.pose.position.y    = float(wp[1])
-            ps.pose.position.z    = 0.0
             ps.pose.orientation.w = 1.0
             msg.poses.append(ps)
         self.path_pub.publish(msg)
 
-    def _publish_grid(self):
-        msg = OccupancyGrid()
-        msg.header.stamp          = self.get_clock().now().to_msg()
-        msg.header.frame_id       = 'map'
-        msg.info.resolution       = float(RESOLUTION)
-        msg.info.width            = self.grid.shape[1]
-        msg.info.height           = self.grid.shape[0]
-        msg.info.origin.position.x = float(X_MIN)
-        msg.info.origin.position.y = float(Y_MIN)
-        msg.info.origin.orientation.w = 1.0
-        msg.data = (self.grid * 100).astype(np.int8).flatten().tolist()
-        self.grid_pub.publish(msg)
+    def _publish_dashboard_markers(self):
+        # 1. Red Marker for the Car
+        if self.car_x is not None:
+            car_marker = Marker()
+            car_marker.header.stamp = self.get_clock().now().to_msg()
+            car_marker.header.frame_id = 'map'
+            car_marker.ns = 'car'
+            car_marker.id = 0
+            car_marker.type = Marker.CUBE
+            car_marker.action = Marker.ADD
+            car_marker.pose.position.x = self.car_x
+            car_marker.pose.position.y = self.car_y
+            car_marker.pose.position.z = 0.5
+            car_marker.pose.orientation.z = math.sin(self.car_yaw / 2.0)
+            car_marker.pose.orientation.w = math.cos(self.car_yaw / 2.0)
+            car_marker.scale.x = 2.9  # Physical length of GEM e4
+            car_marker.scale.y = 1.4  # Physical width
+            car_marker.scale.z = 1.0
+            car_marker.color.r = 1.0  # RED
+            car_marker.color.g = 0.0
+            car_marker.color.b = 0.0
+            car_marker.color.a = 0.8
+            self.car_marker_pub.publish(car_marker)
+
+        # 2. Yellow Markers for the Goals
+        if self.wp_queue:
+            goal_array = MarkerArray()
+            for i, (wx, wy) in enumerate(self.wp_queue):
+                m = Marker()
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.header.frame_id = 'map'
+                m.ns = 'goals'
+                m.id = i
+                m.type = Marker.CYLINDER
+                m.action = Marker.ADD
+                m.pose.position.x = float(wx)
+                m.pose.position.y = float(wy)
+                m.pose.position.z = 0.1
+                m.scale.x = 1.5
+                m.scale.y = 1.5
+                m.scale.z = 0.2
+                m.color.r = 1.0  # YELLOW
+                m.color.g = 1.0
+                m.color.b = 0.0
+                m.color.a = 0.9
+                goal_array.markers.append(m)
+            self.goal_marker_pub.publish(goal_array)
 
 
 # ═══════════════════════════════════════════════════════════════
 
 def main(args=None):
     rclpy.init(args=args)
-    node = VLMPlannerNode()
+    node = PlannerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

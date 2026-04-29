@@ -27,7 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'perception_node = gem_vlm_nav.perception_node:main',
+            'vlm_node = gem_vlm_nav.vlm_node:main',
+            'lidar_bev_node = gem_vlm_nav.lidar_bev_node:main',
             'planner_node = gem_vlm_nav.planner_node:main',
         ],
     },
