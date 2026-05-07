@@ -389,21 +389,17 @@ class VLMPlannerNode(Node):
 
             self.get_logger().warn(
                 'PACMod enabled — forward gear engaged')
-            return
 
         # ── Joystick DISABLE (LB only) ────────────────────────
-        if joy == 0 and self.pacmod_enable:
+        elif joy == 0 and self.pacmod_enable:
             self.global_cmd.enable = False
             self.global_pub.publish(self.global_cmd)
             self.turn_cmd.command = 1
             self.turn_pub.publish(self.turn_cmd)
             self.get_logger().warn('Joystick Disabled — vehicle disabled')
-            return
 
         # ── Execute controller ────────────────────────────────
-        if joy != 0 and self.pacmod_enable:
-            if not self.has_plan or self.car_x is None:
-                return
+        elif joy != 0 and self.pacmod_enable:
 
             # Current vehicle state with antenna offset correction
             curr_yaw = ins_heading_to_yaw(self.heading)
@@ -412,6 +408,20 @@ class VLMPlannerNode(Node):
             curr_y = local_y - OFFSET * math.sin(curr_yaw)
 
             car_state = (curr_x, curr_y, curr_yaw)
+
+            # ── Standby: no plan yet — hold brake, keep PACMod alive ──
+            if not self.has_plan or self.car_x is None:
+                self.brake_cmd.command = 0.0
+                self.accel_cmd.command = 0.0
+                self.brake_pub.publish(self.brake_cmd)
+                self.accel_pub.publish(self.accel_cmd)
+
+                # Re-assert enable + gear every cycle so PACMod stays engaged
+                self.global_cmd.enable = True
+                self.global_pub.publish(self.global_cmd)
+                self.gear_cmd.command = GEAR_DRIVE
+                self.gear_pub.publish(self.gear_cmd)
+                return
 
             # Goal reached check
             gx, gy = self.planner.global_path[-1]
@@ -460,8 +470,11 @@ class VLMPlannerNode(Node):
             self.accel_pub.publish(self.accel_cmd)
             self.brake_pub.publish(self.brake_cmd)
 
+            # Re-assert enable + gear every cycle (keeps PACMod alive)
             self.global_cmd.enable = True
             self.global_pub.publish(self.global_cmd)
+            self.gear_cmd.command = GEAR_DRIVE
+            self.gear_pub.publish(self.gear_cmd)
 
             self.get_logger().info(
                 f"Pos: ({curr_x:.2f}, {curr_y:.2f})  "
