@@ -275,6 +275,7 @@ class PlannerNode(Node):
         self.car_y        = None
         self.car_yaw      = 0.0
         self.pacmod_enable = False
+        self.gem_enable    = False   # True after we send PACMod enable sequence
 
         # ── Mission state ──────────────────────────────────────
         self.wp_queue     = []      # list of (x,y) from VLM
@@ -410,34 +411,52 @@ class PlannerNode(Node):
     #  CONTROL LOOP  (20 Hz)
     # ══════════════════════════════════════════════════════════
 
+    def _enable_pacmod(self):
+        """Send the PACMod enable + DRIVE gear sequence."""
+        self.global_cmd.enable         = True
+        self.global_cmd.clear_override = True
+        self.global_pub.publish(self.global_cmd)
+        self.gear_cmd.command = GEAR_DRIVE
+        self.gear_pub.publish(self.gear_cmd)
+        self.brake_cmd.command = 0.0; self.brake_pub.publish(self.brake_cmd)
+        self.accel_cmd.command = 0.0; self.accel_pub.publish(self.accel_cmd)
+        self.turn_cmd.command  = 3;   self.turn_pub.publish(self.turn_cmd)
+        self.gem_enable = True
+        self.get_logger().warn('PACMod enabled, DRIVE gear engaged')
+
+    def _keep_pacmod_alive(self):
+        """Re-assert enable + DRIVE every cycle so PACMod stays engaged."""
+        self.global_cmd.enable = True
+        self.global_pub.publish(self.global_cmd)
+        self.gear_cmd.command = GEAR_DRIVE
+        self.gear_pub.publish(self.gear_cmd)
+
     def control_loop(self):
         self._publish_dashboard_markers()
         joy = self._check_joystick()
 
-        # ── Joystick ENABLE ───────────────────────────────────
+        # ── Joystick ENABLE (LB + RB) ─────────────────────────
         if joy == 1 and not self.pacmod_enable:
-            self.global_cmd.enable = True
-            self.global_cmd.clear_override = True
-            self.global_pub.publish(self.global_cmd)
-            self.gear_cmd.command = GEAR_DRIVE
-            self.gear_pub.publish(self.gear_cmd)
-            self.brake_cmd.command = 0.0; self.brake_pub.publish(self.brake_cmd)
-            self.accel_cmd.command = 0.0; self.accel_pub.publish(self.accel_cmd)
-            self.turn_cmd.command  = 3;   self.turn_pub.publish(self.turn_cmd)
-            self.get_logger().warn('PACMod enabled, DRIVE gear engaged')
-            return
+            self._enable_pacmod()
 
-        # ── Joystick DISABLE ──────────────────────────────────
-        if joy == 0 and self.pacmod_enable:
+        # ── Joystick DISABLE (LB only) ────────────────────────
+        elif joy == 0 and self.pacmod_enable:
             self.global_cmd.enable = False
             self.global_pub.publish(self.global_cmd)
             self.turn_cmd.command = 1; self.turn_pub.publish(self.turn_cmd)
+            self.gem_enable = False
             self.get_logger().warn('PACMod disabled by joystick')
-            return
 
-        # ── Execute ───────────────────────────────────────────
-        if joy != 0 and self.pacmod_enable:
+        # ── No joystick: auto-enable once GPS is ready ────────
+        elif self._joy is None and not self.gem_enable and self.car_x is not None:
+            self._enable_pacmod()
+
+        # ── Execute controller ────────────────────────────────
+        #    Runs when joystick isn't disabling AND PACMod is
+        #    enabled (either by callback or by our own enable)
+        if joy != 0 and (self.pacmod_enable or self.gem_enable):
             if self.car_x is None:
+                self._keep_pacmod_alive()
                 return
 
             if self.mode == 'arrived':
@@ -446,6 +465,8 @@ class PlannerNode(Node):
                 return
 
             if self.mode == 'idle':
+                # Keep PACMod alive in idle so it doesn't disengage
+                self._keep_pacmod_alive()
                 return
 
             # ── Check waypoint arrival ─────────────────────────
@@ -475,6 +496,7 @@ class PlannerNode(Node):
 
             # ── Normal navigation ──────────────────────────────
             if self.path is None:
+                self._keep_pacmod_alive()
                 return
 
             # Vehicle state with antenna offset (same as pure_pursuit_ros2.py)
@@ -497,8 +519,9 @@ class PlannerNode(Node):
             self.brake_cmd.command = 0.0
             self.accel_pub.publish(self.accel_cmd)
             self.brake_pub.publish(self.brake_cmd)
-            self.global_cmd.enable = True
-            self.global_pub.publish(self.global_cmd)
+
+            # Re-assert enable + gear every cycle
+            self._keep_pacmod_alive()
 
             # Log
             if self.path_idx % 20 == 0 and self.wp_queue:
@@ -561,8 +584,9 @@ class PlannerNode(Node):
     def _stop(self):
         self.accel_cmd.command = 0.0; self.accel_pub.publish(self.accel_cmd)
         self.brake_cmd.command = 0.3; self.brake_pub.publish(self.brake_cmd)
-        self.global_cmd.enable = False; self.global_pub.publish(self.global_cmd)
-        self.turn_cmd.command  = 1;    self.turn_pub.publish(self.turn_cmd)
+        # Keep PACMod enabled so the vehicle can resume when new goals arrive
+        self.global_cmd.enable = True; self.global_pub.publish(self.global_cmd)
+        self.gear_cmd.command  = GEAR_DRIVE; self.gear_pub.publish(self.gear_cmd)
 
     def _check_joystick(self) -> int:
         if self._joy is None: return 2
