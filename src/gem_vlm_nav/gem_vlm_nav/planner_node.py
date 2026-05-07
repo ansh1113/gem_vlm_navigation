@@ -221,7 +221,8 @@ class VLMPlannerNode(Node):
         self.car_yaw = 0.0
 
         # ── Planning state ────────────────────────────────────
-        self.has_plan = False
+        self.has_plan   = False
+        self.gem_enable = False   # True after we send the PACMod enable sequence
 
         # ── PACMod command objects (same as pure_pursuit_ros2.py)
         self.global_cmd = GlobalCmd(enable=False, clear_override=True)
@@ -366,29 +367,34 @@ class VLMPlannerNode(Node):
     #  CONTROL LOOP  (20 Hz)
     # ══════════════════════════════════════════════════════════
 
+    def _enable_pacmod(self):
+        """Send the PACMod enable + DRIVE gear sequence."""
+        self.global_cmd.enable         = True
+        self.global_cmd.clear_override = True
+        self.global_pub.publish(self.global_cmd)
+
+        self.gear_cmd.command = GEAR_DRIVE
+        self.gear_pub.publish(self.gear_cmd)
+
+        self.brake_cmd.command = 0.0
+        self.brake_pub.publish(self.brake_cmd)
+
+        self.accel_cmd.command = 0.0
+        self.accel_pub.publish(self.accel_cmd)
+
+        self.turn_cmd.command = 3   # no signal
+        self.turn_pub.publish(self.turn_cmd)
+
+        self.gem_enable = True
+        self.get_logger().warn(
+            'PACMod enabled — forward gear engaged')
+
     def control_loop(self):
         joy = self._check_joystick()
 
         # ── Joystick ENABLE (LB + RB) ─────────────────────────
         if joy == 1 and not self.pacmod_enable:
-            self.global_cmd.enable      = True
-            self.global_cmd.clear_override = True
-            self.global_pub.publish(self.global_cmd)
-
-            self.gear_cmd.command = GEAR_DRIVE
-            self.gear_pub.publish(self.gear_cmd)
-
-            self.brake_cmd.command = 0.0
-            self.brake_pub.publish(self.brake_cmd)
-
-            self.accel_cmd.command = 0.0
-            self.accel_pub.publish(self.accel_cmd)
-
-            self.turn_cmd.command = 3   # no signal
-            self.turn_pub.publish(self.turn_cmd)
-
-            self.get_logger().warn(
-                'PACMod enabled — forward gear engaged')
+            self._enable_pacmod()
 
         # ── Joystick DISABLE (LB only) ────────────────────────
         elif joy == 0 and self.pacmod_enable:
@@ -396,10 +402,17 @@ class VLMPlannerNode(Node):
             self.global_pub.publish(self.global_cmd)
             self.turn_cmd.command = 1
             self.turn_pub.publish(self.turn_cmd)
+            self.gem_enable = False
             self.get_logger().warn('Joystick Disabled — vehicle disabled')
 
+        # ── No joystick: auto-enable PACMod once GPS is ready ─
+        elif self._joystick is None and not self.gem_enable and self.car_x is not None:
+            self._enable_pacmod()
+
         # ── Execute controller ────────────────────────────────
-        elif joy != 0 and self.pacmod_enable:
+        #    Runs when: joystick is not disabling AND
+        #               (PACMod acked enable OR we sent enable ourselves)
+        if joy != 0 and (self.pacmod_enable or self.gem_enable):
 
             # Current vehicle state with antenna offset correction
             curr_yaw = ins_heading_to_yaw(self.heading)
@@ -409,14 +422,14 @@ class VLMPlannerNode(Node):
 
             car_state = (curr_x, curr_y, curr_yaw)
 
-            # ── Standby: no plan yet — hold brake, keep PACMod alive ──
+            # ── Standby: no plan yet — keep PACMod alive ──────
             if not self.has_plan or self.car_x is None:
                 self.brake_cmd.command = 0.0
                 self.accel_cmd.command = 0.0
                 self.brake_pub.publish(self.brake_cmd)
                 self.accel_pub.publish(self.accel_cmd)
 
-                # Re-assert enable + gear every cycle so PACMod stays engaged
+                # Re-assert enable + gear every cycle
                 self.global_cmd.enable = True
                 self.global_pub.publish(self.global_cmd)
                 self.gear_cmd.command = GEAR_DRIVE
