@@ -563,7 +563,7 @@ class PlannerNode(Node):
         alpha     = math.atan2(ty - cy, tx - cx) - cyaw
         alpha     = normalize_angle(alpha)
         curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
-        front_deg = math.degrees(math.atan(WHEELBASE * curvature))
+            front_deg = math.degrees(math.atan(WHEELBASE * curvature))
 
         return self._front2steer(front_deg)
 
