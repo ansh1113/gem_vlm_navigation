@@ -2,80 +2,83 @@
 """
 lidar_bev_node.py — LiDAR Bird's-Eye-View Image + Costmap Publisher
 =====================================================================
+ROS1 (Noetic) simulator port of the original ROS2 lidar_bev_node.
+
 Runs at 5Hz. Produces two outputs every cycle:
 
 1. /lidar_bev_image  (sensor_msgs/Image)
-   A top-down grayscale image of the parking lot rendered from the
-   Ouster LiDAR pointcloud. Passed directly to the VLM as a second
-   camera input giving 360° spatial context.
-
-   Rendering:
-     - Slice pointcloud at obstacle height (0.1–2.0m above sensor)
-     - Project each point onto 2D grid from above
-     - Intensity = point density (brighter = more returns = solid object)
-     - Vehicle footprint drawn at center as white rectangle
-     - North arrow + scale bar overlaid for VLM spatial orientation
+   Top-down BEV image rendered from the Ouster LiDAR pointcloud.
+   Vehicle-centred, shows BEV_RANGE_M metres in every direction.
 
 2. /vlm_costmap  (nav_msgs/OccupancyGrid)
-   Live binary occupancy grid consumed by planner_node for A* and
-   obstacle avoidance. Separate from the BEV image — finer resolution.
+   Live binary occupancy grid for A* / obstacle avoidance.
+   Covers the full navigatable area at GRID_RES_M resolution.
 
 Topics (in):
-  /ouster/points   — Ouster OS1-128 LiDAR pointcloud
-  /navsatfix       — Septentrio GNSS (for ENU position)
-  /insnavgeod      — Septentrio INS heading
+  /ouster/points                — Ouster LiDAR pointcloud
+  /gps/fix                      — Simulated GPS (sensor_msgs/NavSatFix)
+  /septentrio_gnss/insnavgeod   — Simulated INS heading
 
 Topics (out):
-  /lidar_bev_image — Bird's-eye-view image for VLM
-  /vlm_costmap     — OccupancyGrid for path planner
+  /lidar_bev_image              — BEV image (frame: base_link)
+  /vlm_costmap                  — OccupancyGrid (frame: world)
+
+Usage:
+  source devel/setup.bash
+  python3 lidar_bev_node.py
+
+NOTE: Change X_MIN/X_MAX/Y_MIN/Y_MAX to adjust the navigatable area.
+      Everything else derives from those four values automatically.
 """
 
 import math
 import numpy as np
 import cv2
 
-import rclpy
-from rclpy.node import Node
+import rospy
 from sensor_msgs.msg import PointCloud2, NavSatFix, Image
 from nav_msgs.msg import OccupancyGrid
 from septentrio_gnss_driver.msg import INSNavGeod
-import sensor_msgs_py.point_cloud2 as pc2
+import sensor_msgs.point_cloud2 as pc2
 from cv_bridge import CvBridge
 import pymap3d as pm
-import scipy.ndimage as ndimage
 
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-ORIGIN_LAT = 40.0927422
-ORIGIN_LON = -88.2359639
+# ENU origin — matches the Gazebo world's <spherical_coordinates>
+# so that GPS ENU coords align with Gazebo world frame coords.
+ORIGIN_LAT = 40.0928381
+ORIGIN_LON = -88.2356367
 
-# Operating area
-X_MIN, X_MAX = -25.0, 75.0
-Y_MIN, Y_MAX =  -5.0, 20.0
+# Navigatable area bounds in ENU / Gazebo world frame (metres).
+# Change these four values and everything else adapts automatically.
+X_MIN = -50
+X_MAX =  40
+Y_MIN = -12
+Y_MAX =  5
 
-# BEV image — vehicle centred, shows SENSOR_RANGE meters around car
-# Smaller range = more detail around vehicle for VLM
-BEV_RANGE_M   = 20.0   # meters in each direction from vehicle
-BEV_RES_M     = 0.15   # meters per pixel — finer than costmap
-BEV_SIZE_PX   = int(2 * BEV_RANGE_M / BEV_RES_M)   # square image
+# BEV image — vehicle centred, shows BEV_RANGE_M metres around car
+BEV_RANGE_M  = 20.0    # metres in each direction from vehicle
+BEV_RES_M    = 0.15    # metres per pixel
+BEV_SIZE_PX  = int(2 * BEV_RANGE_M / BEV_RES_M)   # square image side (px)
 
-# Costmap grid — full lot coverage, coarser for A*
-GRID_RES_M    = 0.5
-GRID_NC       = int(np.ceil((X_MAX - X_MIN) / GRID_RES_M))
-GRID_NR       = int(np.ceil((Y_MAX - Y_MIN) / GRID_RES_M))
+# Costmap grid — full area coverage, coarser resolution for A*
+GRID_RES_M   = 0.5
+GRID_NC      = int(np.ceil((X_MAX - X_MIN) / GRID_RES_M))   # columns (x)
+GRID_NR      = int(np.ceil((Y_MAX - Y_MIN) / GRID_RES_M))   # rows    (y)
 
-# LiDAR height filter
-Z_MIN =  0.10   # m — ignore ground returns
-Z_MAX =  2.50   # m — ignore ceiling / overhead structure
+# LiDAR height filter (metres above sensor origin)
+Z_MIN =  0   # ignore ground returns below this
+Z_MAX =  3.00   # ignore ceiling / overhead structure above this
 
 # GEM e4 footprint for BEV overlay
-CAR_LENGTH = 2.9
-CAR_WIDTH  = 1.4
+CAR_LENGTH = 2.9   # metres
+CAR_WIDTH  = 1.4   # metres
 
-# BEV publish rate
-BEV_HZ = 5
+# Publish rate
+BEV_HZ = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -83,15 +86,18 @@ BEV_HZ = 5
 # ═══════════════════════════════════════════════════════════════
 
 def ins_heading_to_yaw(h: float) -> float:
+    """
+    Convert Septentrio INS heading (degrees, 0=North, clockwise)
+    to ROS yaw (radians, 0=East, counter-clockwise).
+    Matches the original ROS2 conversion exactly.
+    """
     return math.radians(90.0 - h) if h < 270.0 else math.radians(450.0 - h)
 
 def world_to_cell(x, y):
+    """Convert world-frame (x, y) to costmap (col, row). No bounds check."""
     c = int((x - X_MIN) / GRID_RES_M)
     r = int((y - Y_MIN) / GRID_RES_M)
     return c, r
-
-def cell_to_world(c, r):
-    return X_MIN + (c + 0.5) * GRID_RES_M, Y_MIN + (r + 0.5) * GRID_RES_M
 
 def in_bounds_grid(c, r):
     return 0 <= r < GRID_NR and 0 <= c < GRID_NC
@@ -101,61 +107,81 @@ def in_bounds_grid(c, r):
 #  NODE
 # ═══════════════════════════════════════════════════════════════
 
-class LidarBEVNode(Node):
+class LidarBEVNode:
     def __init__(self):
-        super().__init__('lidar_bev_node')
+        rospy.init_node('lidar_bev_node', anonymous=False)
 
-        self.bridge     = CvBridge()
-        self.latest_pc  = None
-        self.car_x      = None
-        self.car_y      = None
-        self.car_yaw    = 0.0
+        self.bridge    = CvBridge()
+        self.latest_pc = None
+        self.car_x     = None
+        self.car_y     = None
+        self.car_yaw   = 0.0
 
-        # Occupancy grid — pre-fill boundary walls
+        # Occupancy grid — pre-fill boundary walls, updated each cycle
         self.grid = self._build_base_grid()
 
-        # Subscriptions
-        self.create_subscription(
-            PointCloud2, '/ouster/points', self.lidar_cb, 10)
-        self.create_subscription(
-            NavSatFix, '/navsatfix', self.gps_cb, 10)
-        self.create_subscription(
-            INSNavGeod, '/insnavgeod', self.ins_cb, 10)
+        # ── Subscribers ──────────────────────────────────────
+        # Large buff_size for pointcloud — ROS1 drops messages without it
+        rospy.Subscriber('/ouster/points', PointCloud2, self.lidar_cb,
+                         queue_size=1, buff_size=2**24)
 
-        # Publishers
-        self.bev_pub  = self.create_publisher(Image,         '/lidar_bev_image', 10)
-        self.grid_pub = self.create_publisher(OccupancyGrid, '/vlm_costmap',     10)
+        # GPS → ENU position (same message type as original /navsatfix)
+        rospy.Subscriber('/gps/fix', NavSatFix, self.gps_cb,
+                         queue_size=1)
 
-        # Timer
-        self.create_timer(1.0 / BEV_HZ, self.publish_cycle)
+        # INS heading (same message type and conversion as original)
+        rospy.Subscriber('/septentrio_gnss/insnavgeod', INSNavGeod, self.ins_cb,
+                         queue_size=1)
 
-        self.get_logger().info(
-            f"LiDAR BEV node ready. "
-            f"BEV: {BEV_SIZE_PX}x{BEV_SIZE_PX}px @ {BEV_RES_M}m/px  "
-            f"Range: ±{BEV_RANGE_M}m around vehicle")
+        # ── Publishers ───────────────────────────────────────
+        self.bev_pub  = rospy.Publisher('/lidar_bev_image', Image,
+                                        queue_size=1)
+        self.grid_pub = rospy.Publisher('/vlm_costmap', OccupancyGrid,
+                                        queue_size=1, latch=True)
 
-    # ── Callbacks ─────────────────────────────────────────────
+        # ── Timer ────────────────────────────────────────────
+        rospy.Timer(rospy.Duration(1.0 / BEV_HZ), self.publish_cycle)
+
+        rospy.loginfo(
+            "[lidar_bev] Ready.  BEV: %dpx @ %.2fm/px  Range: +/-%.0fm  "
+            "Grid: %dx%d @ %.1fm/cell  Area: x=[%.1f,%.1f] y=[%.1f,%.1f]",
+            BEV_SIZE_PX, BEV_RES_M, BEV_RANGE_M,
+            GRID_NC, GRID_NR, GRID_RES_M,
+            X_MIN, X_MAX, Y_MIN, Y_MAX
+        )
+
+    # ── Callbacks ──────────────────────────────────────────────
 
     def gps_cb(self, msg: NavSatFix):
+        """
+        Convert GPS lat/lon to ENU using the Gazebo world's spherical
+        coordinate origin. This aligns GPS ENU with Gazebo world frame.
+        Identical logic to original ROS2 gps_cb.
+        """
         try:
             e, n, _ = pm.geodetic2enu(
                 msg.latitude, msg.longitude, 0,
                 ORIGIN_LAT, ORIGIN_LON, 0)
-            self.car_x, self.car_y = float(e), float(n)
-        except Exception:
-            pass
+            self.car_x = float(e)
+            self.car_y = float(n)
+        except Exception as ex:
+            rospy.logwarn_throttle(5.0, "[lidar_bev] GPS conversion failed: %s", str(ex))
 
     def ins_cb(self, msg: INSNavGeod):
+        """
+        Extract yaw from INS heading.
+        Identical logic to original ROS2 ins_cb.
+        """
         if msg.heading is not None and not math.isnan(msg.heading):
             self.car_yaw = ins_heading_to_yaw(msg.heading)
 
     def lidar_cb(self, msg: PointCloud2):
-        # Store latest — processed on publish cycle
+        """Store latest pointcloud — processed on the publish timer."""
         self.latest_pc = msg
 
-    # ── Main publish cycle ────────────────────────────────────
+    # ── Main publish cycle ─────────────────────────────────────
 
-    def publish_cycle(self):
+    def publish_cycle(self, _event):
         if self.latest_pc is None or self.car_x is None:
             return
 
@@ -167,20 +193,20 @@ class LidarBEVNode(Node):
         obs_mask = (points[:, 2] > Z_MIN) & (points[:, 2] < Z_MAX)
         obs_pts  = points[obs_mask]
 
-        # Transform sensor-frame points → ENU map frame
+        # Transform sensor-frame points → ENU world frame
         map_pts = self._sensor_to_map(obs_pts)
 
-        # Update costmap grid
+        # Update costmap with new obstacles
         self._update_grid(map_pts)
 
-        # Generate and publish BEV image
+        # Render and publish BEV image
         bev_img = self._render_bev(map_pts)
         self._publish_bev(bev_img)
 
         # Publish costmap
         self._publish_costmap()
 
-    # ── Pointcloud parsing ────────────────────────────────────
+    # ── Pointcloud parsing ─────────────────────────────────────
 
     def _parse_pointcloud(self, msg: PointCloud2):
         pts_list = list(pc2.read_points(
@@ -191,35 +217,47 @@ class LidarBEVNode(Node):
         pts = pts[~np.isnan(pts).any(axis=1)]
         return pts if len(pts) > 0 else None
 
-    # ── Coordinate transform ──────────────────────────────────
+    # ── Coordinate transform ───────────────────────────────────
 
     def _sensor_to_map(self, pts: np.ndarray) -> np.ndarray:
-        """Transform Ouster sensor-frame points to ENU map frame."""
+        """
+        Transform Ouster sensor-frame points → ENU map frame.
+        Negates X and Y to correct the 180° backwards physical mount.
+        Identical logic to original ROS2 _sensor_to_map.
+        """
         cos_y = math.cos(self.car_yaw)
         sin_y = math.sin(self.car_yaw)
-        
-        # --- FIX: 180-Degree LiDAR Flip ---
-        # Negating the X and Y axes to correct the backwards physical mount
+
+        # Negate X and Y to correct backwards physical mount
         pts_x = -pts[:, 0]
         pts_y = -pts[:, 1]
-        
-        # Vectorised rotation + translation using the flipped points
+
         map_x = self.car_x + pts_x * cos_y - pts_y * sin_y
         map_y = self.car_y + pts_x * sin_y + pts_y * cos_y
         map_z = pts[:, 2]
-        
+
         return np.column_stack([map_x, map_y, map_z])
 
-    # ── Costmap update ────────────────────────────────────────
+    # ── Costmap ────────────────────────────────────────────────
 
     def _build_base_grid(self) -> np.ndarray:
+        """
+        Build static base grid with 1m boundary walls pre-filled.
+        Driven entirely by X_MIN/X_MAX/Y_MIN/Y_MAX and GRID_RES_M.
+        """
         g = np.zeros((GRID_NR, GRID_NC), dtype=np.uint8)
         w = max(1, int(1.0 / GRID_RES_M))
-        g[:w, :] = g[-w:, :] = g[:, :w] = g[:, -w:] = 1
+        g[:w,  :]  = 1   # south wall
+        g[-w:, :]  = 1   # north wall
+        g[:,  :w]  = 1   # west  wall
+        g[:, -w:]  = 1   # east  wall
         return g
 
     def _update_grid(self, map_pts: np.ndarray):
-        """Refresh dynamic obstacles — keep boundary walls."""
+        """
+        Clear interior dynamic obstacles then re-fill from current scan.
+        Boundary walls are never cleared.
+        """
         wall = max(1, int(1.0 / GRID_RES_M))
         self.grid[wall:-wall, wall:-wall] = 0
         for p in map_pts:
@@ -227,19 +265,23 @@ class LidarBEVNode(Node):
             if in_bounds_grid(c, r):
                 self.grid[r, c] = 1
 
-    # ── BEV image rendering ───────────────────────────────────
+    # ── BEV image rendering ────────────────────────────────────
 
     def _render_bev(self, map_pts: np.ndarray) -> np.ndarray:
         """
-        Render a top-down BEV image centred on the vehicle.
+        Render top-down BEV image centred on the vehicle.
 
-        Convention (important for VLM prompt):
-          - Vehicle is at image centre, pointing UP (North in image = vehicle forward)
-          - Each pixel = BEV_RES_M meters
-          - Obstacles: bright white
-          - Free space: dark background
+        Convention:
+          - Vehicle at image centre, pointing UP (forward = up in image)
+          - Each pixel = BEV_RES_M metres
+          - Obstacles: coloured by height (orange=low, white/blue=high)
+          - Free space: dark blue-grey background
           - Vehicle footprint: green rectangle at centre
-          - Compass rose + scale bar overlaid
+          - Navigatable area boundary rectangle
+          - Forward arrow, FWD label, scale bar, distance rings
+
+        All pixel math derives from BEV_RANGE_M and BEV_RES_M.
+        Boundary rectangle derives from X_MIN/X_MAX/Y_MIN/Y_MAX.
         """
         img = np.zeros((BEV_SIZE_PX, BEV_SIZE_PX, 3), dtype=np.uint8)
         img[:, :] = (20, 25, 40)   # dark blue-grey background
@@ -247,130 +289,126 @@ class LidarBEVNode(Node):
         cx_px = BEV_SIZE_PX // 2
         cy_px = BEV_SIZE_PX // 2
 
-        # Rotate map points into vehicle-centred frame
-        # Vehicle frame: forward=up in image, right=right in image
-        cos_y = math.cos(-self.car_yaw)   # negative = rotate world to vehicle frame
+        # Rotation: ENU world frame → vehicle-centred image frame
+        cos_y = math.cos(-self.car_yaw)
         sin_y = math.sin(-self.car_yaw)
 
-        # Draw obstacle points
+        # ── Obstacle points ──────────────────────────────────
         for p in map_pts:
-            # Relative position in ENU
             dx = p[0] - self.car_x
             dy = p[1] - self.car_y
-            
-            # FIX: Convert to vehicle base_link frame (x=forward, y=left)
+
             v_forward = dx * cos_y - dy * sin_y
             v_left    = dx * sin_y + dy * cos_y
 
-            # FIX: Map to image pixels (image x=right, image y=down)
-            px = int(cx_px - v_left / BEV_RES_M)
+            px = int(cx_px - v_left    / BEV_RES_M)
             py = int(cy_px - v_forward / BEV_RES_M)
 
             if 0 <= px < BEV_SIZE_PX and 0 <= py < BEV_SIZE_PX:
-                # Colour by height: low=orange, high=white
                 z_norm = max(0.0, min(1.0, (p[2] - Z_MIN) / (Z_MAX - Z_MIN)))
-                b = int(200 + 55 * z_norm)
+                b   = int(200 + 55 * z_norm)
                 g_c = int(150 + 50 * (1 - z_norm))
                 r_c = int(80  + 80 * (1 - z_norm))
-                # CHANGE TO RADIUS 1 to make it look less chunky
                 cv2.circle(img, (px, py), 1, (r_c, g_c, b), -1)
 
-        # Draw lot boundary as thin rectangle
-        # Convert lot corners to vehicle frame
-        corners_enu = [
+        # ── Navigatable area boundary rectangle ──────────────
+        corners_world = [
             (X_MIN, Y_MIN), (X_MAX, Y_MIN),
-            (X_MAX, Y_MAX), (X_MIN, Y_MAX)]
-        corners_px  = []
-        for (ex, ey) in corners_enu:
-            dx = ex - self.car_x; dy = ey - self.car_y
-            # FIX: Apply same exact rotation mapping here
+            (X_MAX, Y_MAX), (X_MIN, Y_MAX),
+        ]
+        corners_px = []
+        for (wx, wy) in corners_world:
+            dx = wx - self.car_x
+            dy = wy - self.car_y
             v_forward = dx * cos_y - dy * sin_y
             v_left    = dx * sin_y + dy * cos_y
-            px = int(cx_px - v_left / BEV_RES_M)
+            px = int(cx_px - v_left    / BEV_RES_M)
             py = int(cy_px - v_forward / BEV_RES_M)
             corners_px.append((px, py))
-        cv2.polylines(img, [np.array(corners_px)], True, (80, 120, 160), 1)
+        cv2.polylines(img, [np.array(corners_px, dtype=np.int32)],
+                      True, (80, 120, 160), 1)
 
-        # Draw vehicle footprint at centre (green rectangle)
+        # ── Vehicle footprint ────────────────────────────────
         car_l_px = int(CAR_LENGTH / BEV_RES_M)
         car_w_px = int(CAR_WIDTH  / BEV_RES_M)
         car_rect = np.array([
-            [-car_w_px//2, -car_l_px//2],
-            [ car_w_px//2, -car_l_px//2],
-            [ car_w_px//2,  car_l_px//2],
-            [-car_w_px//2,  car_l_px//2],
+            [-car_w_px // 2, -car_l_px // 2],
+            [ car_w_px // 2, -car_l_px // 2],
+            [ car_w_px // 2,  car_l_px // 2],
+            [-car_w_px // 2,  car_l_px // 2],
         ]) + np.array([cx_px, cy_px])
-        cv2.fillPoly(img, [car_rect.astype(np.int32)], (40, 200, 80))
+        cv2.fillPoly(img,  [car_rect.astype(np.int32)], (40, 200, 80))
         cv2.polylines(img, [car_rect.astype(np.int32)], True, (255, 255, 255), 1)
 
-        # Forward direction arrow (vehicle points up)
+        # ── Forward direction arrow ──────────────────────────
         arrow_len = int(1.5 / BEV_RES_M)
         cv2.arrowedLine(img,
             (cx_px, cy_px),
             (cx_px, cy_px - arrow_len),
             (255, 255, 100), 2, tipLength=0.3)
 
-        # Compass: "FWD" label at top
+        # ── FWD label ────────────────────────────────────────
         cv2.putText(img, "FWD", (cx_px - 15, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 100), 1)
 
-        # Scale bar: 5m
-        bar_px  = int(5.0 / BEV_RES_M)
-        bar_y   = BEV_SIZE_PX - 15
-        bar_x0  = 15
+        # ── Scale bar (5m) ───────────────────────────────────
+        bar_px = int(5.0 / BEV_RES_M)
+        bar_y  = BEV_SIZE_PX - 15
+        bar_x0 = 15
         cv2.line(img, (bar_x0, bar_y), (bar_x0 + bar_px, bar_y),
                  (200, 200, 200), 2)
         cv2.putText(img, "5m", (bar_x0 + bar_px + 5, bar_y + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-        # Distance rings at 5m and 10m
+        # ── Distance rings ───────────────────────────────────
         for ring_m in [5.0, 10.0]:
             r_px = int(ring_m / BEV_RES_M)
-            cv2.circle(img, (cx_px, cy_px), r_px,
-                       (50, 60, 80), 1)
+            cv2.circle(img, (cx_px, cy_px), r_px, (50, 60, 80), 1)
             cv2.putText(img, f"{int(ring_m)}m",
                         (cx_px + r_px + 2, cy_px),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 100, 120), 1)
 
         return img
 
-    # ── Publishers ────────────────────────────────────────────
+    # ── Publishers ─────────────────────────────────────────────
 
     def _publish_bev(self, img: np.ndarray):
         try:
             msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
-            msg.header.stamp    = self.get_clock().now().to_msg()
+            msg.header.stamp    = rospy.Time.now()
             msg.header.frame_id = 'base_link'
             self.bev_pub.publish(msg)
         except Exception as e:
-            self.get_logger().warn(f"BEV publish failed: {e}")
+            rospy.logwarn("[lidar_bev] BEV publish failed: %s", str(e))
 
     def _publish_costmap(self):
         msg = OccupancyGrid()
-        msg.header.stamp             = self.get_clock().now().to_msg()
-        msg.header.frame_id          = 'map'
-        msg.info.resolution          = float(GRID_RES_M)
-        msg.info.width               = GRID_NC
-        msg.info.height              = GRID_NR
-        msg.info.origin.position.x   = float(X_MIN)
-        msg.info.origin.position.y   = float(Y_MIN)
+        msg.header.stamp    = rospy.Time.now()
+        msg.header.frame_id = 'world'
+
+        msg.info.resolution = float(GRID_RES_M)
+        msg.info.width      = GRID_NC
+        msg.info.height     = GRID_NR
+
+        # Origin = SW corner of the navigatable area in world frame
+        # Adapts automatically when X_MIN/Y_MIN change
+        msg.info.origin.position.x    = float(X_MIN)
+        msg.info.origin.position.y    = float(Y_MIN)
+        msg.info.origin.position.z    = 0.0
         msg.info.origin.orientation.w = 1.0
+
         msg.data = (self.grid * 100).astype(np.int8).flatten().tolist()
         self.grid_pub.publish(msg)
 
 
 # ═══════════════════════════════════════════════════════════════
 
-def main(args=None):
-    rclpy.init(args=args)
+def main():
     node = LidarBEVNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    rospy.spin()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
