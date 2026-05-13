@@ -13,7 +13,7 @@ User command → VLM (GPT-4o) → ENU waypoints → A* on LiDAR costmap → Stan
 
 | Node | File | Role |
 |---|---|---|
-| Gazebo world | `high_bay_3d.world` | Simulated indoor environment |
+| Gazebo world | `high_bay_3d.world` | Simulated Highbay Parking Lot environment |
 | `gazebo_tf_publisher` | `gazebo_tf_publisher.py` | Broadcasts `world → base_footprint` TF at 50 Hz |
 | `lidar_bev_node` | `lidar_bev_node.py` | Builds LiDAR BEV image + `/vlm_costmap` OccupancyGrid at 5 Hz |
 | `vlm_node` | `vlm_node.py` | Queries GPT-4o with RGB + BEV images; outputs locked ENU waypoints |
