@@ -1,632 +1,730 @@
 #!/usr/bin/env python3
+"""
+planner_node.py — Segment-Replanning A* Planner + Stanley Controller
+=====================================================================
 
-#================================================================
-# File name: planner_node.py
-# Description: VLM goal tracker using A* + pure pursuit in ROS2
-#              Low-level PACMod interface identical to pure_pursuit.py
-# Based on: pure_pursuit.py by Jiaming Zhang, Hang Cui (2025-06-03)
-#================================================================
+Architecture
+------------
+                        ┌─────────────────────────────────────┐
+  /vlm_waypoints  ──────►                                     │
+  /vlm_costmap    ──────►   PlannerNode                       │
+  /gazebo/...     ──────►                                     │
+                        │  1. A* from current_pos through     │
+                        │     all VLM waypoints (chained)     │
+                        │  2. Spline-smooth the raw path      │
+                        │  3. Stanley tracks the smooth path  │
+                        │  4. On arrival at each intermediate │
+                        │     VLM waypoint → replan with      │
+                        │     fresh costmap                   │
+                        │  5. On arrival at final waypoint    │
+                        │     → stop, publish "arrived"       │
+                        └─────────────────────────────────────┘
+                                        │
+                                  /ackermann_cmd
+                                  /planner_path
+                                  /planner_status
 
+Topics (in):
+    /vlm_waypoints          — PoseArray, ENU world frame
+    /vlm_costmap            — OccupancyGrid, ENU world frame
+    /gazebo/get_model_state — ground-truth pose + twist
+
+Topics (out):
+    /ackermann_cmd          — AckermannDrive
+    /planner_path           — nav_msgs/Path  (RViz visualisation)
+    /planner_status         — String  ("planning"|"tracking"|"arrived"|"idle")
+
+Usage:
+    source devel/setup.bash
+    python3 planner_node.py
+"""
+
+import csv
 import math
 import heapq
+import os
+import tempfile
+import threading
+import time
+from collections import defaultdict
 
 import numpy as np
-import scipy.ndimage as ndimage
-import scipy.signal as signal
+import rospy
 from scipy.interpolate import splprep, splev
-import pymap3d as pm
-import pygame
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
-
-from std_msgs.msg import Bool
-from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import PoseStamped, PoseArray
-from nav_msgs.msg import Path, OccupancyGrid
-from pacmod2_msgs.msg import (
-    PositionWithSpeed, VehicleSpeedRpt,
-    GlobalCmd, SystemCmdFloat, SystemCmdInt,
-)
-from septentrio_gnss_driver.msg import INSNavGeod
-
-# ── Joystick init (same as pure_pursuit.py) ───────────────────
-pygame.init()
-pygame.joystick.init()
-if pygame.joystick.get_count() == 0:
-    raise RuntimeError("No joystick connected")
-joystick = pygame.joystick.Joystick(0)
-joystick.init()
+from ackermann_msgs.msg import AckermannDrive
+from geometry_msgs.msg import PoseArray, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Path
+from std_msgs.msg import String
+from gazebo_msgs.srv import GetModelState
+from tf.transformations import euler_from_quaternion
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION  (same values as pure_pursuit.py)
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-ORIGIN_LAT = 40.0927422
-ORIGIN_LON = -88.2359639
+# Gazebo model name — verify with: rostopic echo /gazebo/model_states | grep name
+MODEL_NAME = 'gem_e4'
 
-# Grid bounds (metres ENU) — highbay operating area
-X_MIN, X_MAX = -25.0, 75.0
-Y_MIN, Y_MAX =  -5.0, 20.0
+# Navigatable zone — MUST match lidar_bev_node.py and vlm_node.py exactly
+X_MIN = -50
+X_MAX =  40
+Y_MIN = -12
+Y_MAX =  5
 
-RESOLUTION  = 0.5    # m/cell
-INFLATE_R   = 1.5    # m — obstacle inflation radius (car half-width + margin)
+# Vehicle
+WHEELBASE = 1.75        # metres — matches the working stanley_sim.py
 
-LOOK_AHEAD    = 5.0
-WHEELBASE     = 2.57
-OFFSET        = 1.26
-DESIRED_SPEED = 2.0
-MAX_ACCEL     = 0.5
+# Stanley
+STANLEY_K         = 0.45   # cross-track gain
+STANLEY_HZ        = 20.0   # control loop rate (Hz)
+SPEED_BASE        = 2.8    # normal cruise speed (m/s)
+SPEED_SLOW        = 1.5    # near-obstacle speed
+SPEED_TURN        = 1.8    # sharp-turn speed
+SPEED_APPROACH    = 1.2    # final-approach ramp top
+SPEED_MIN         = 0.3    # absolute floor while moving
+MAX_STEER_RAD     = 0.6    # steering clamp
 
-GOAL_TOL = 1.5   # m — stop when this close to goal
+# Speed trigger thresholds
+SLOW_OBSTACLE_M   = 3.0    # metres — slow when nearest obstacle < this
+SLOW_STEER_RAD    = 0.35   # radians — slow when |steer| > this
+SLOW_FINAL_M      = 5.0    # metres — begin approach ramp inside this
 
-# PID (same as pure_pursuit.py defaults)
-PID_KP, PID_KI, PID_KD, PID_WG = 0.6, 0.0, 0.1, 10.0
+# Arrival radii
+WP_ARRIVE_M       = 2.5    # metres — advance to next VLM waypoint
+FINAL_ARRIVE_M    = 1.5    # metres — declare "arrived" at final goal
 
-# Filter (same as pure_pursuit.py defaults)
-FILTER_CUTOFF, FILTER_FS, FILTER_ORDER = 1.2, 30, 4
-
-# front2steer polynomial (same as pure_pursuit.py)
-STEER_A       = -0.1084
-STEER_B       = 21.775
-STEER_MAX_DEG = 35
-
-GEAR_NEUTRAL = 2
-GEAR_DRIVE   = 3
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PID — verbatim from pure_pursuit.py
-# ═══════════════════════════════════════════════════════════════
-
-class PID:
-    def __init__(self, kp, ki, kd, wg=None):
-        self.kp = kp; self.ki = ki; self.kd = kd; self.wg = wg
-        self.iterm = 0; self.last_e = 0; self.last_t = None
-
-    def reset(self):
-        self.iterm = 0; self.last_e = 0; self.last_t = None
-
-    def get_control(self, t, e):
-        if self.last_t is None:
-            dt = de = 0.0
-        else:
-            dt = t - self.last_t
-            de = (e - self.last_e) / dt if dt > 0.0 else 0.0
-        self.iterm += e * dt
-        if self.wg is not None:
-            self.iterm = max(min(self.iterm, self.wg), -self.wg)
-        self.last_e = e
-        self.last_t = t
-        return self.kp * e + self.ki * self.iterm + self.kd * de
+# A* / costmap
+INFLATE_CELLS     = 1      # obstacle inflation in grid cells (1 cell = 0.5 m)
+YAW_PENALTY       = 2.0    # A* turn-cost weight (from reference planner)
+SPLINE_POINTS     = 250    # output points from splprep smoother
+REPLAN_INTERVAL_S = 3.0    # replan mid-segment every N seconds while tracking
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FILTER — verbatim from pure_pursuit.py
+#  ZONE CLAMPING
 # ═══════════════════════════════════════════════════════════════
 
-class OnlineFilter:
-    def __init__(self, cutoff, fs, order):
-        nyq = 0.5 * fs
-        normal_cutoff = cutoff / nyq
-        self.b, self.a = signal.butter(order, normal_cutoff, btype='low', analog=False)
-        self.z = signal.lfilter_zi(self.b, self.a)
-
-    def get_data(self, data):
-        filted, self.z = signal.lfilter(self.b, self.a, [data], zi=self.z)
-        return filted[0]
+def _clamp_to_zone(x, y, margin=0.0):
+    return (
+        max(X_MIN + margin, min(X_MAX - margin, float(x))),
+        max(Y_MIN + margin, min(Y_MAX - margin, float(y))),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
-#  GRID + A*
+#  COSTMAP WRAPPER
 # ═══════════════════════════════════════════════════════════════
 
-def world_to_cell(x, y):
-    return int((x - X_MIN) / RESOLUTION), int((y - Y_MIN) / RESOLUTION)
+class CostmapInfo:
+    """Wraps a nav_msgs/OccupancyGrid for coordinate conversion and lookup."""
 
-def cell_to_world(c, r):
-    return X_MIN + (c + 0.5) * RESOLUTION, Y_MIN + (r + 0.5) * RESOLUTION
+    def __init__(self, msg):
+        self.res  = msg.info.resolution
+        self.nc   = msg.info.width
+        self.nr   = msg.info.height
+        self.ox   = msg.info.origin.position.x
+        self.oy   = msg.info.origin.position.y
+        raw       = np.array(msg.data, dtype=np.int8).reshape(self.nr, self.nc)
+        self.grid = (raw > 0).astype(np.uint8)   # 1=occupied 0=free
 
-def in_bounds(c, r, shape):
-    return 0 <= r < shape[0] and 0 <= c < shape[1]
+    def world_to_cell(self, wx, wy):
+        c = int((wx - self.ox) / self.res)
+        r = int((wy - self.oy) / self.res)
+        return r, c
 
-def build_base_grid():
-    nc = int(np.ceil((X_MAX - X_MIN) / RESOLUTION))
-    nr = int(np.ceil((Y_MAX - Y_MIN) / RESOLUTION))
-    g  = np.zeros((nr, nc), dtype=np.uint8)
-    # Wall border (1 m)
-    w = max(1, int(1.0 / RESOLUTION))
-    g[:w, :] = g[-w:, :] = g[:, :w] = g[:, -w:] = 1
-    return g
+    def cell_to_world(self, r, c):
+        return (self.ox + (c + 0.5) * self.res,
+                self.oy + (r + 0.5) * self.res)
 
-def inflate_grid(grid, r_m):
-    r = max(1, int(r_m / RESOLUTION))
-    s = np.zeros((2*r+1, 2*r+1), dtype=bool)
-    for i in range(2*r+1):
-        for j in range(2*r+1):
-            if (i-r)**2 + (j-r)**2 <= r**2:
-                s[i, j] = True
-    return ndimage.binary_dilation(grid.astype(bool), structure=s).astype(np.uint8)
+    def in_bounds(self, r, c):
+        return 0 <= r < self.nr and 0 <= c < self.nc
 
-def astar(grid, start_world, goal_world):
-    sc = world_to_cell(*start_world)
-    gc = world_to_cell(*goal_world)
+    def nearest_obstacle_dist(self, wx, wy):
+        r0, c0 = self.world_to_cell(wx, wy)
+        search  = int(SLOW_OBSTACLE_M / self.res) + 2
+        best    = SLOW_OBSTACLE_M + 1.0
+        for dr in range(-search, search + 1):
+            for dc in range(-search, search + 1):
+                rr, cc = r0 + dr, c0 + dc
+                if self.in_bounds(rr, cc) and self.grid[rr, cc]:
+                    d = math.hypot(dr, dc) * self.res
+                    if d < best:
+                        best = d
+        return best
 
-    # Snap to nearest free cell if start/goal lands in obstacle
-    def snap(c, r):
-        if in_bounds(c, r, grid.shape) and grid[r, c] == 0:
-            return c, r
-        for rd in range(1, 15):
-            for dc in range(-rd, rd+1):
-                for dr in range(-rd, rd+1):
-                    nc2, nr2 = c+dc, r+dr
-                    if in_bounds(nc2, nr2, grid.shape) and grid[nr2, nc2] == 0:
-                        return nc2, nr2
-        return c, r
 
-    sc = snap(*sc)
-    gc = snap(*gc)
+# ═══════════════════════════════════════════════════════════════
+#  A*
+# ═══════════════════════════════════════════════════════════════
 
-    if not in_bounds(*sc, grid.shape) or not in_bounds(*gc, grid.shape):
-        return None
+def _inflate(grid, radius):
+    if radius == 0:
+        return grid.copy()
+    out = grid.copy()
+    nr, nc = grid.shape
+    for r, c in zip(*np.where(grid > 0)):
+        out[max(0, r-radius):min(nr, r+radius+1),
+            max(0, c-radius):min(nc, c+radius+1)] = 1
+    return out
 
-    nbrs = [(1,0,1.0),(-1,0,1.0),(0,1,1.0),(0,-1,1.0),
-            (1,1,1.414),(1,-1,1.414),(-1,1,1.414),(-1,-1,1.414)]
-    heap = [(0.0, sc)]
-    came = {}
-    gs   = {sc: 0.0}
+
+def _snap_to_free(grid, r, c):
+    """Spiral outward from (r,c) to find nearest free cell."""
+    nr, nc = grid.shape
+    if 0 <= r < nr and 0 <= c < nc and grid[r, c] == 0:
+        return r, c
+    for radius in range(1, 20):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < nr and 0 <= cc < nc and grid[rr, cc] == 0:
+                    return rr, cc
+    return r, c
+
+
+def _angle_diff(a, b):
+    d = a - b
+    while d >  math.pi: d -= 2 * math.pi
+    while d < -math.pi: d += 2 * math.pi
+    return d
+
+
+def astar(grid, start, goal, start_yaw=0.0, yaw_penalty=YAW_PENALTY):
+    """
+    Yaw-penalised 8-connected A* on a binary grid.
+    Incorporates turn cost so the raw path already prefers gentle curves.
+
+    Parameters
+    ----------
+    grid        : (NR, NC) uint8 — 1=obstacle, 0=free
+    start/goal  : (row, col)
+    start_yaw   : vehicle heading at start (radians, ENU)
+    yaw_penalty : cost weight per radian of heading change
+
+    Returns list of (row, col), or [] on failure.
+    """
+    nr, nc = grid.shape
+
+    MOVES = [
+        ( 0,  1, 1.0,          0.0),
+        ( 0, -1, 1.0,          math.pi),
+        ( 1,  0, 1.0,          math.pi / 2),
+        (-1,  0, 1.0,         -math.pi / 2),
+        ( 1,  1, math.sqrt(2), math.pi / 4),
+        ( 1, -1, math.sqrt(2),-math.pi / 4),
+        (-1,  1, math.sqrt(2), 3 * math.pi / 4),
+        (-1, -1, math.sqrt(2),-3 * math.pi / 4),
+    ]
+
+    def valid(r, c):
+        return 0 <= r < nr and 0 <= c < nc and grid[r, c] == 0
+
+    start = _snap_to_free(grid, *start)
+    goal  = _snap_to_free(grid, *goal)
+
+    if not valid(*start) or not valid(*goal):
+        return []
+    if start == goal:
+        return [start]
+
+    def heur(r, c):
+        dr = abs(r - goal[0]); dc = abs(c - goal[1])
+        return max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
+
+    g_cost  = defaultdict(lambda: float('inf'))
+    g_cost[start] = 0.0
+    parent  = {}
+    heading = {start: start_yaw}
+    heap    = [(heur(*start), start[0], start[1])]
 
     while heap:
-        _, cur = heapq.heappop(heap)
-        if cur == gc:
+        f, r, c = heapq.heappop(heap)
+        cur = (r, c)
+
+        if cur == goal:
             path = []
-            while cur in came:
-                path.append(cell_to_world(*cur))
-                cur = came[cur]
-            path.append(cell_to_world(*sc))
+            while cur in parent:
+                path.append(cur)
+                cur = parent[cur]
+            path.append(start)
             path.reverse()
             return path
-        c, r = cur
-        for dc, dr, cost in nbrs:
-            nb = (c+dc, r+dr)
-            if not in_bounds(nb[0], nb[1], grid.shape):
-                continue
-            if grid[nb[1], nb[0]] == 1:
-                continue
-            t = gs[cur] + cost
-            if t < gs.get(nb, 1e9):
-                came[nb] = cur
-                gs[nb]   = t
-                heapq.heappush(heap,
-                    (t + math.hypot(nb[0]-gc[0], nb[1]-gc[1]), nb))
-    return None
 
-def smooth_path(path, n=200):
-    if not path or len(path) < 3:
-        return path
-    pts = np.array(path)
+        if f > g_cost[cur] + heur(*cur) + 1e-6:
+            continue
+
+        cur_h = heading[cur]
+        for dr, dc, dist, move_h in MOVES:
+            nb = (r + dr, c + dc)
+            if not valid(*nb):
+                continue
+            ng = g_cost[cur] + dist + yaw_penalty * abs(_angle_diff(move_h, cur_h))
+            if ng < g_cost[nb]:
+                g_cost[nb]  = ng
+                parent[nb]  = cur
+                heading[nb] = move_h
+                heapq.heappush(heap, (ng + heur(*nb), nb[0], nb[1]))
+
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PATH SMOOTHING + HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def _smooth(world_pts, n_points=SPLINE_POINTS):
+    """
+    splprep/splev B-spline smoothing (same approach as reference Planner._smooth).
+    Deduplicates, fits spline with s=2.0, evaluates at n_points.
+    Clamps output to navigatable zone. Falls back to raw on failure.
+    """
+    if not world_pts or len(world_pts) < 3:
+        return [_clamp_to_zone(x, y) for x, y in world_pts]
+
+    pts = np.array(world_pts, dtype=np.float64)
     _, idx = np.unique(pts, axis=0, return_index=True)
     pts = pts[np.sort(idx)]
+
     if len(pts) < 3:
-        return path
+        return [_clamp_to_zone(*p) for p in pts]
+
     try:
-        tck, _ = splprep([pts[:,0], pts[:,1]], s=2.0, k=min(3, len(pts)-1))
-        xs, ys = splev(np.linspace(0, 1, n), tck)
-        return list(zip(xs.tolist(), ys.tolist()))
-    except Exception:
-        return path
+        tck, _ = splprep([pts[:, 0], pts[:, 1]],
+                         s=2.0, k=min(3, len(pts) - 1))
+        xs, ys = splev(np.linspace(0, 1, n_points), tck)
+        return [_clamp_to_zone(float(x), float(y)) for x, y in zip(xs, ys)]
+    except Exception as e:
+        rospy.logwarn("[planner] Spline failed (%s) — using raw path.", str(e))
+        return [_clamp_to_zone(x, y) for x, y in world_pts]
+
+
+def _compute_yaws(path):
+    if len(path) < 2:
+        return [0.0] * len(path)
+    yaws = []
+    for i in range(len(path) - 1):
+        dx = path[i+1][0] - path[i][0]
+        dy = path[i+1][1] - path[i][1]
+        yaws.append(math.atan2(dy, dx))
+    yaws.append(yaws[-1])
+    return yaws
+
+
+def _pi_2_pi(a):
+    while a >  math.pi: a -= 2 * math.pi
+    while a < -math.pi: a += 2 * math.pi
+    return a
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STANLEY CONTROLLER
+# ═══════════════════════════════════════════════════════════════
+
+class Stanley:
+    """
+    Stanley controller that tracks an in-memory list of (x, y) waypoints.
+
+    Logic follows stanley_sim.py exactly:
+      - Front-axle reference point
+      - WHEELBASE = 1.75 m
+      - model_name = 'gem_e4'
+      - target_index clamped to len-2
+      - Braking loop on halt
+
+    Speed scheduling (obstacle, sharp turn, final approach) layered on top.
+    """
+
+    def __init__(self, get_state_fn, ackermann_pub):
+        self._get_state = get_state_fn
+        self._pub       = ackermann_pub
+        self.path_x     = []
+        self.path_y     = []
+
+    def load_path(self, path):
+        self.path_x = [p[0] for p in path]
+        self.path_y = [p[1] for p in path]
+
+    def get_vehicle_state(self):
+        try:
+            resp = self._get_state(model_name=MODEL_NAME,
+                                   relative_entity_name='world')
+        except rospy.ServiceException as e:
+            rospy.logwarn_throttle(5.0, "[stanley] get_model_state: %s", str(e))
+            return None, None, None, None, None
+        p = resp.pose.position
+        o = resp.pose.orientation
+        v = resp.twist.linear
+        _, _, yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])
+        return (round(float(p.x), 4), round(float(p.y), 4),
+                round(float(v.x), 4), round(float(v.y), 4),
+                round(float(yaw),  4))
+
+    def _send(self, speed, steer):
+        msg = AckermannDrive()
+        msg.speed          = float(speed)
+        msg.steering_angle = float(steer)
+        self._pub.publish(msg)
+
+    def stop(self):
+        self._send(0.0, 0.0)
+
+    def brake_to_halt(self, rate):
+        """Negative-speed braking loop from stanley_sim.py."""
+        rospy.loginfo("[stanley] Braking to halt.")
+        while not rospy.is_shutdown():
+            _, _, xd, yd, _ = self.get_vehicle_state()
+            if xd is None:
+                break
+            if math.hypot(xd, yd) < 0.05:
+                self._send(0.0, 0.0)
+                break
+            self._send(-2.8, 0.0)
+            rate.sleep()
+
+    def step(self, costmap=None):
+        """
+        One Stanley control tick.
+
+        Returns 'tracking', 'arrived', or None (state unavailable).
+        """
+        if not self.path_x:
+            return 'arrived'
+
+        curr_x, curr_y, xd, yd, curr_yaw = self.get_vehicle_state()
+        if curr_x is None:
+            return None
+
+        # Front axle position
+        front_x = curr_x + WHEELBASE * math.cos(curr_yaw)
+        front_y = curr_y + WHEELBASE * math.sin(curr_yaw)
+
+        # Closest path point (by front-axle distance) — clamped to len-2
+        dx = [front_x - px for px in self.path_x]
+        dy = [front_y - py for py in self.path_y]
+        target_index = int(np.argmin(np.hypot(dx, dy)))
+        target_index = min(target_index, len(self.path_x) - 2)
+
+        # Cross-track error (signed, via rotated front-axle vector)
+        front_axle_vec = np.array([math.cos(curr_yaw - math.pi / 2.0),
+                                   math.sin(curr_yaw - math.pi / 2.0)])
+        vec_t2f = np.array([dx[target_index], dy[target_index]])
+        ef = float(np.dot(vec_t2f, front_axle_vec))
+
+        # Heading error from path tangent
+        theta_p = math.atan2(
+            self.path_y[target_index + 1] - self.path_y[target_index],
+            self.path_x[target_index + 1] - self.path_x[target_index])
+        theta_e = _pi_2_pi(theta_p - curr_yaw)
+
+        f_vel = max(math.hypot(xd, yd), 0.1)
+
+        # Stanley law
+        delta = theta_e + math.atan2(STANLEY_K * ef, f_vel)
+        delta = max(-MAX_STEER_RAD, min(MAX_STEER_RAD, delta))
+
+        # ── Speed schedule ────────────────────────────────────
+        speed = SPEED_BASE
+
+        if costmap is not None:
+            obs_d = costmap.nearest_obstacle_dist(curr_x, curr_y)
+            if obs_d < SLOW_OBSTACLE_M:
+                t = obs_d / SLOW_OBSTACLE_M
+                speed = min(speed, SPEED_SLOW + t * (SPEED_BASE - SPEED_SLOW))
+
+        if abs(delta) > SLOW_STEER_RAD:
+            speed = min(speed, SPEED_TURN)
+
+        dist_end = math.hypot(curr_x - self.path_x[-1],
+                              curr_y - self.path_y[-1])
+        if dist_end < SLOW_FINAL_M:
+            t = dist_end / SLOW_FINAL_M
+            speed = min(speed, SPEED_MIN + t * (SPEED_APPROACH - SPEED_MIN))
+
+        speed = max(speed, SPEED_MIN)
+
+        self._send(speed, delta)
+
+        rospy.logdebug(
+            "[stanley] ef=%.3f  θe=%.1f°  δ=%.3f  spd=%.2f",
+            ef, math.degrees(theta_e), delta, speed)
+
+        return 'tracking'
 
 
 # ═══════════════════════════════════════════════════════════════
 #  PLANNER NODE
 # ═══════════════════════════════════════════════════════════════
 
-class PlannerNode(Node):
+class PlannerNode:
+
     def __init__(self):
-        super().__init__('planner_node')
+        rospy.init_node('planner_node', anonymous=False)
 
-        # ── Parameters — same as pure_pursuit.py ──────────────
-        self.declare_parameter('rate_hz',          20)
-        self.declare_parameter('look_ahead',        5.0)
-        self.declare_parameter('wheelbase',         2.57)
-        self.declare_parameter('offset',            1.26)
-        self.declare_parameter('origin_lat',        40.0927422)
-        self.declare_parameter('origin_lon',       -88.2359639)
-        self.declare_parameter('desired_speed',     2.0)
-        self.declare_parameter('max_acceleration',  0.5)
-        self.declare_parameter('pid/kp',            0.6)
-        self.declare_parameter('pid/ki',            0.0)
-        self.declare_parameter('pid/kd',            0.1)
-        self.declare_parameter('pid/wg',            10)
-        self.declare_parameter('filter/cutoff',     1.2)
-        self.declare_parameter('filter/fs',         30)
-        self.declare_parameter('filter/order',      4)
-        self.declare_parameter('vehicle_name',      '')
+        # ── State ─────────────────────────────────────────────
+        self.vlm_waypoints  = []     # list of (x,y) clamped to zone
+        self.latest_costmap = None   # CostmapInfo, updated by subscriber
+        self._lock          = threading.Lock()
 
-        vehicle_name = self.get_parameter('vehicle_name').value
-        if vehicle_name == '':
-            self.get_logger().warn(
-                "No vehicle_name parameter — defaulting to e4 parameters.")
-        else:
-            self.get_logger().info(f"Using vehicle config: {vehicle_name}")
+        # ── Gazebo service ────────────────────────────────────
+        rospy.loginfo("[planner] Waiting for /gazebo/get_model_state …")
+        rospy.wait_for_service('/gazebo/get_model_state')
+        self._get_state = rospy.ServiceProxy('/gazebo/get_model_state',
+                                             GetModelState)
+        rospy.loginfo("[planner] Gazebo service ready.")
 
-        self.rate_hz       = self.get_parameter('rate_hz').value
-        self.look_ahead    = self.get_parameter('look_ahead').value
-        self.wheelbase     = self.get_parameter('wheelbase').value
-        self.offset        = self.get_parameter('offset').value
-        self.olat          = self.get_parameter('origin_lat').value
-        self.olon          = self.get_parameter('origin_lon').value
-        self.desired_speed = min(5.0, self.get_parameter('desired_speed').value)
-        self.max_accel     = min(2.0, self.get_parameter('max_acceleration').value)
+        # ── Publishers ────────────────────────────────────────
+        self._ack_pub    = rospy.Publisher('/ackermann_cmd',  AckermannDrive,
+                                           queue_size=1)
+        self._path_pub   = rospy.Publisher('/planner_path',   Path,
+                                           queue_size=1, latch=True)
+        self._status_pub = rospy.Publisher('/planner_status', String,
+                                           queue_size=1, latch=True)
 
-        self.pid_speed = PID(
-            kp=self.get_parameter('pid/kp').value,
-            ki=self.get_parameter('pid/ki').value,
-            kd=self.get_parameter('pid/kd').value,
-            wg=self.get_parameter('pid/wg').value,
-        )
-        self.speed_filter = OnlineFilter(
-            cutoff=self.get_parameter('filter/cutoff').value,
-            fs=self.get_parameter('filter/fs').value,
-            order=self.get_parameter('filter/order').value,
-        )
+        # ── Stanley ───────────────────────────────────────────
+        self._stanley      = Stanley(self._get_state, self._ack_pub)
+        self._stanley_rate = rospy.Rate(STANLEY_HZ)
 
-        # ── Vehicle state — same as pure_pursuit.py ───────────
-        self.lat           = 0.0
-        self.lon           = 0.0
-        self.heading       = 0.0
-        self.speed         = 0.0
-        self.pacmod_enable = False
-        self.gem_enable    = False
+        # ── Subscribers (start after everything else is ready) ─
+        rospy.Subscriber('/vlm_waypoints', PoseArray,     self._wp_cb,      queue_size=1)
+        rospy.Subscriber('/vlm_costmap',   OccupancyGrid, self._costmap_cb, queue_size=1)
 
-        # ENU position (derived)
-        self.car_x = None
-        self.car_y = None
+        self._publish_status("idle")
+        rospy.loginfo("[planner] Ready.  Waiting for /vlm_waypoints …")
 
-        # ── Planning state ────────────────────────────────────
-        self.grid     = build_base_grid()   # static obstacle grid
-        self.path     = []                  # smoothed A* path [(x,y), ...]
-        self.goal_idx = 0                   # current lookahead index
-        self.has_plan = False
-        self.goal_xy  = None               # (gx, gy) of current goal
+        # Main loop runs in this thread
+        self._run()
 
-        # ── PACMod commands — same as pure_pursuit.py ─────────
-        self.global_cmd = GlobalCmd(enable=False, clear_override=True)
-        self.gear_cmd   = SystemCmdInt(command=GEAR_NEUTRAL)
-        self.brake_cmd  = SystemCmdFloat(command=0.0)
-        self.accel_cmd  = SystemCmdFloat(command=0.0)
-        self.turn_cmd   = SystemCmdInt(command=1)
-        self.steer_cmd  = PositionWithSpeed(
-            angular_position=0.0, angular_velocity_limit=4.0)
+    # ── ROS callbacks ─────────────────────────────────────────
 
-        # ── Subscriptions — pure_pursuit.py topics + goal ─────
-        self.create_subscription(NavSatFix,       '/navsatfix',
-                                 self.gnss_callback,   10)
-        self.create_subscription(INSNavGeod,      '/insnavgeod',
-                                 self.ins_callback,    10)
-        self.create_subscription(Bool,            '/pacmod/enabled',
-                                 self.enable_callback, 10)
-        self.create_subscription(VehicleSpeedRpt, '/pacmod/vehicle_speed_rpt',
-                                 self.speed_callback,  10)
+    def _wp_cb(self, msg):
+        wps = [_clamp_to_zone(p.position.x, p.position.y) for p in msg.poses]
+        with self._lock:
+            self.vlm_waypoints = wps
+        if wps:
+            rospy.loginfo("[planner] New VLM waypoints (%d). Will replan.", len(wps))
+            for i, (wx, wy) in enumerate(wps):
+                rospy.loginfo("[planner]   wp[%d] = (%.3f, %.3f)", i, wx, wy)
 
-        # Goal from VLM/perception — TRANSIENT_LOCAL so we don't miss it
-        goal_qos = QoSProfile(depth=10,
-                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(PoseStamped, '/vlm_goal',
-                                 self.goal_callback, goal_qos)
+    def _costmap_cb(self, msg):
+        with self._lock:
+            self.latest_costmap = CostmapInfo(msg)
 
-        # Also accept a PoseArray of waypoints (for multi-waypoint VLM output)
-        self.create_subscription(PoseArray, '/vlm_waypoints',
-                                 self.waypoints_callback, goal_qos)
+    # ── Main loop ─────────────────────────────────────────────
 
-        # Optional: live costmap from external node
-        self.create_subscription(OccupancyGrid, '/vlm_costmap',
-                                 self.costmap_callback, 10)
+    def _run(self):
+        """
+        Outer loop:
+          1. Wait for waypoints + costmap.
+          2. A* from current pos through ALL remaining VLM waypoints (chained).
+          3. Smooth → load into Stanley.
+          4. Stanley tracks until it arrives at waypoints[0].
+          5. Pop waypoints[0]; if more remain → replan with fresh costmap.
+          6. If none remain → brake + "arrived".
+        """
+        while not rospy.is_shutdown():
 
-        # ── Publishers — identical to pure_pursuit.py ─────────
-        self.global_pub = self.create_publisher(GlobalCmd,         '/pacmod/global_cmd',   10)
-        self.gear_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/shift_cmd',    10)
-        self.brake_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/brake_cmd',    10)
-        self.accel_pub  = self.create_publisher(SystemCmdFloat,    '/pacmod/accel_cmd',    10)
-        self.turn_pub   = self.create_publisher(SystemCmdInt,      '/pacmod/turn_cmd',     10)
-        self.steer_pub  = self.create_publisher(PositionWithSpeed, '/pacmod/steering_cmd', 10)
+            with self._lock:
+                wps = list(self.vlm_waypoints)
+                cm  = self.latest_costmap
 
-        # Visualization
-        self.path_pub = self.create_publisher(Path, '/vlm_path', 10)
+            if not wps or cm is None:
+                self._stanley_rate.sleep()
+                continue
 
-        # ── Control timer — same rate as pure_pursuit.py ──────
-        self.timer = self.create_timer(1.0 / self.rate_hz, self.control_loop)
+            # Get current pose
+            car_x, car_y, _, _, car_yaw = self._stanley.get_vehicle_state()
+            if car_x is None:
+                self._stanley_rate.sleep()
+                continue
 
-        self.get_logger().info(
-            "Planner node ready. Waiting for /vlm_goal or /vlm_waypoints. "
-            "Use joystick LB+RB to enable.")
+            # Already at final goal?
+            fx, fy = wps[-1]
+            dist_to_final = math.hypot(car_x - fx, car_y - fy)
+            rospy.loginfo(
+                "[planner] car=(%.3f, %.3f)  final_wp=(%.3f, %.3f)  dist=%.3f  threshold=%.3f",
+                car_x, car_y, fx, fy, dist_to_final, FINAL_ARRIVE_M)
+            if dist_to_final < FINAL_ARRIVE_M:
+                rospy.loginfo("[planner] Already at final goal — done.")
+                self._stanley.brake_to_halt(self._stanley_rate)
+                self._publish_status("arrived")
+                with self._lock:
+                    self.vlm_waypoints = []
+                continue
 
-    # ══════════════════════════════════════════════════════════
-    #  SENSOR CALLBACKS — verbatim from pure_pursuit.py
-    # ══════════════════════════════════════════════════════════
+            # ── Plan ──────────────────────────────────────────
+            self._publish_status("planning")
+            path = self._plan_path(car_x, car_y, car_yaw, wps, cm)
 
-    def gnss_callback(self, msg):
-        self.lat = msg.latitude
-        self.lon = msg.longitude
-        # Also keep ENU position up to date for planning
-        try:
-            e, n, _ = pm.geodetic2enu(
-                self.lat, self.lon, 0, self.olat, self.olon, 0)
-            self.car_x = float(e)
-            self.car_y = float(n)
-        except Exception:
-            pass
+            if path is None or len(path) < 2:
+                rospy.logwarn_throttle(2.0,
+                    "[planner] A* failed — retrying next cycle.")
+                self._stanley_rate.sleep()
+                continue
 
-    def ins_callback(self, msg):
-        self.heading = msg.heading
+            # ── Load + track ───────────────────────────────────
+            self._stanley.load_path(path)
+            self._publish_path(path)
+            self._publish_status("tracking")
+            rospy.loginfo("[planner] Tracking %d-pt path → first wp (%.1f, %.1f).",
+                          len(path), wps[0][0], wps[0][1])
 
-    def speed_callback(self, msg):
-        self.speed = self.speed_filter.get_data(msg.vehicle_speed)
+            reached = self._track_to_waypoint(wps[0])
 
-    def enable_callback(self, msg):
-        self.pacmod_enable = msg.data
+            # ── Advance ────────────────────────────────────────
+            if reached:
+                with self._lock:
+                    if self.vlm_waypoints:
+                        self.vlm_waypoints.pop(0)
+                    remaining = list(self.vlm_waypoints)
 
-    def costmap_callback(self, msg: OccupancyGrid):
-        """Accept a live costmap from an external node (e.g. lidar_bev_node)."""
-        nr   = msg.info.height
-        nc   = msg.info.width
-        data = np.array(msg.data, dtype=np.int8).reshape(nr, nc)
-        self.grid = (data > 50).astype(np.uint8)
+                if not remaining:
+                    self._stanley.brake_to_halt(self._stanley_rate)
+                    self._publish_status("arrived")
+                    rospy.loginfo("[planner] Final VLM waypoint reached.")
+                else:
+                    rospy.loginfo(
+                        "[planner] Intermediate wp reached. "
+                        "%d remaining. Replanning …", len(remaining))
+                    # Loop continues → fresh costmap + replan
 
-    # ══════════════════════════════════════════════════════════
-    #  GOAL CALLBACKS
-    # ══════════════════════════════════════════════════════════
+    # ── Planning ──────────────────────────────────────────────
 
-    def goal_callback(self, msg: PoseStamped):
-        """Single ENU goal from VLM/perception node."""
-        gx = msg.pose.position.x
-        gy = msg.pose.position.y
+    def _plan_path(self, car_x, car_y, car_yaw, wps, cm):
+        """
+        A* from current_pos → wps[0] → … → wps[-1], all chained.
+        Returns smoothed list of (x, y) world points, or None on failure.
+        """
+        inflated = _inflate(cm.grid, INFLATE_CELLS)
+        chain    = [_clamp_to_zone(car_x, car_y)] + list(wps)
+        full     = []
+        t0       = time.time()
 
-        if math.isnan(gx) or math.isnan(gy):
-            self.get_logger().error("Received NaN goal — ignoring.")
-            return
-        if self.car_x is None:
-            self.get_logger().warn("Goal received but GPS not ready yet.")
-            return
+        for i in range(len(chain) - 1):
+            sx, sy = chain[i]
+            gx, gy = chain[i + 1]
 
-        self.get_logger().info(
-            f"Goal received: ({gx:.2f}, {gy:.2f}) ENU. Running A*...")
-        self._plan_to(gx, gy)
+            sr, sc = cm.world_to_cell(sx, sy)
+            gr, gc = cm.world_to_cell(gx, gy)
 
-    def waypoints_callback(self, msg: PoseArray):
-        """Multi-waypoint list from VLM node — plan to first waypoint."""
-        if not msg.poses:
-            return
-        if self.car_x is None:
-            self.get_logger().warn("Waypoints received but GPS not ready yet.")
-            return
+            sr = max(0, min(cm.nr - 1, sr)); sc = max(0, min(cm.nc - 1, sc))
+            gr = max(0, min(cm.nr - 1, gr)); gc = max(0, min(cm.nc - 1, gc))
 
-        # Plan a single A* path through all waypoints in order
-        # by chaining: current → wp0 → wp1 → ... → wpN
-        all_wps = [(p.position.x, p.position.y) for p in msg.poses]
-        self.get_logger().info(
-            f"Waypoints received ({len(all_wps)}): "
-            + "  ".join(f"({x:.1f},{y:.1f})" for x, y in all_wps))
+            seg_yaw = car_yaw if i == 0 else 0.0
+            cells   = astar(inflated, (sr, sc), (gr, gc),
+                            start_yaw=seg_yaw, yaw_penalty=YAW_PENALTY)
 
-        # Plan to first waypoint from current position
-        self._plan_to(*all_wps[0])
+            if not cells:
+                rospy.logwarn("[planner] A* failed segment %d→%d "
+                              "(%.1f,%.1f)→(%.1f,%.1f).",
+                              i, i+1, sx, sy, gx, gy)
+                return None
 
-    def _plan_to(self, gx: float, gy: float):
-        """Run A* from current ENU position to (gx, gy) and store path."""
-        inf_grid = inflate_grid(self.grid, INFLATE_R)
-        raw = astar(inf_grid, (self.car_x, self.car_y), (gx, gy))
+            seg = [_clamp_to_zone(*cm.cell_to_world(r, c)) for r, c in cells]
+            if full:
+                seg = seg[1:]    # drop duplicate junction point
+            full.extend(seg)
 
-        if raw is None:
-            self.get_logger().error(
-                f"A* found no path to ({gx:.1f}, {gy:.1f}). "
-                "Check goal is inside bounds and not blocked.")
-            self.has_plan = False
-            return
+        smooth = _smooth(full, SPLINE_POINTS)
+        rospy.loginfo("[planner] A*+smooth %.3f s → %d pts",
+                      time.time() - t0, len(smooth))
+        return smooth
 
-        self.path     = smooth_path(raw)
-        self.goal_idx = 0
-        self.goal_xy  = (gx, gy)
-        self.has_plan = True
-        self.pid_speed.reset()
+    # ── Tracking ──────────────────────────────────────────────
 
-        self.get_logger().info(
-            f"Path ready: {len(self.path)} smoothed pts → "
-            f"goal ({gx:.1f}, {gy:.1f})")
-        self._publish_path()
+    def _track_to_waypoint(self, target_wp):
+        """
+        Run Stanley at STANLEY_HZ until the vehicle reaches target_wp
+        within WP_ARRIVE_M, or until waypoints are replaced by a new
+        VLM command, or rospy shuts down.
 
-    # ══════════════════════════════════════════════════════════
-    #  HELPERS — verbatim / minimal delta from pure_pursuit.py
-    # ══════════════════════════════════════════════════════════
+        Every REPLAN_INTERVAL_S seconds, replans from the current pose
+        to the remaining VLM waypoints using the latest costmap, so the
+        path stays clear of obstacles that appear mid-segment.
 
-    def heading_to_yaw(self, heading):
-        """Exact copy from pure_pursuit.py."""
-        return np.radians(90 - heading) if heading < 270 else np.radians(450 - heading)
+        Returns True = reached, False = interrupted.
+        """
+        tx, ty = target_wp
+        last_replan = time.time()
 
-    def wps_to_local_xy(self, lon, lat):
-        """Exact copy from pure_pursuit.py."""
-        x, y, _ = pm.geodetic2enu(lat, lon, 0, self.olat, self.olon, 0)
-        return x, y
+        while not rospy.is_shutdown():
 
-    def get_gem_state(self):
-        """Exact copy from pure_pursuit.py."""
-        local_x, local_y = self.wps_to_local_xy(self.lon, self.lat)
-        yaw = self.heading_to_yaw(self.heading)
-        x = local_x - self.offset * math.cos(yaw)
-        y = local_y - self.offset * math.sin(yaw)
-        return x, y, yaw
+            # Detect new VLM command (waypoints replaced)
+            with self._lock:
+                current_wps = list(self.vlm_waypoints)
+            if not current_wps or current_wps[0] != target_wp:
+                rospy.loginfo("[planner] Waypoints changed — interrupting track.")
+                return False
 
-    def front2steer(self, f_angle):
-        """Exact copy from pure_pursuit.py."""
-        f_angle = max(min(f_angle, 35), -35)
-        angle = abs(f_angle)
-        steer_angle = -0.1084 * angle ** 2 + 21.775 * angle
-        return round(steer_angle if f_angle >= 0 else -steer_angle, 2)
+            # Arrival check
+            car_x, car_y, _, _, car_yaw = self._stanley.get_vehicle_state()
+            if car_x is not None:
+                if math.hypot(car_x - tx, car_y - ty) < WP_ARRIVE_M:
+                    return True
 
-    def check_joystick_enable(self):
-        """Exact copy from pure_pursuit.py."""
-        pygame.event.pump()
-        try:
-            lb = joystick.get_button(6)
-            rb = joystick.get_button(7)
-        except pygame.error:
-            self.get_logger().warn("Joystick read failed")
-            return 2
-        if lb and rb:
-            return 1
-        elif lb and not rb:
-            return 0
-        return 2
+            # Periodic mid-segment replan
+            now = time.time()
+            if car_x is not None and (now - last_replan) >= REPLAN_INTERVAL_S:
+                with self._lock:
+                    cm  = self.latest_costmap
+                    wps = list(self.vlm_waypoints)
+                if cm is not None and wps:
+                    rospy.loginfo("[planner] Mid-segment replan …")
+                    new_path = self._plan_path(car_x, car_y, car_yaw, wps, cm)
+                    if new_path and len(new_path) >= 2:
+                        self._stanley.load_path(new_path)
+                        self._publish_path(new_path)
+                        rospy.loginfo("[planner] Mid-segment replan → %d pts.",
+                                      len(new_path))
+                    else:
+                        rospy.logwarn("[planner] Mid-segment replan failed — "
+                                      "keeping current path.")
+                last_replan = now
 
-    def _publish_path(self):
+            # Stanley step with latest costmap
+            with self._lock:
+                cm = self.latest_costmap
+
+            result = self._stanley.step(costmap=cm)
+            if result == 'arrived':   # Stanley exhausted its path
+                return True
+
+            self._stanley_rate.sleep()
+
+        return False
+
+    # ── Utilities ─────────────────────────────────────────────
+
+    def _publish_status(self, s):
+        msg = String()
+        msg.data = s
+        self._status_pub.publish(msg)
+        rospy.loginfo("[planner] Status → %s", s)
+
+    def _publish_path(self, path):
         msg = Path()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-        for wp in self.path:
+        msg.header.stamp    = rospy.Time.now()
+        msg.header.frame_id = 'world'
+        for x, y in path:
             ps = PoseStamped()
-            ps.header             = msg.header
-            ps.pose.position.x    = float(wp[0])
-            ps.pose.position.y    = float(wp[1])
+            ps.header = msg.header
+            ps.pose.position.x    = x
+            ps.pose.position.y    = y
+            ps.pose.position.z    = 0.0
             ps.pose.orientation.w = 1.0
             msg.poses.append(ps)
-        self.path_pub.publish(msg)
-
-    # ══════════════════════════════════════════════════════════
-    #  CONTROL LOOP — pure_pursuit.py structure, A* path instead of CSV
-    # ══════════════════════════════════════════════════════════
-
-    def control_loop(self):
-        joy_enable = self.check_joystick_enable()
-
-        # ── ENABLE (LB + RB) — identical to pure_pursuit.py ──
-        if joy_enable == 1 and not self.pacmod_enable:
-            self.global_cmd.enable = True
-            self.global_cmd.clear_override = True
-            self.global_pub.publish(self.global_cmd)
-
-            self.gear_cmd.command = GEAR_DRIVE
-            self.gear_pub.publish(self.gear_cmd)
-
-            self.brake_cmd.command = 0.0
-            self.brake_pub.publish(self.brake_cmd)
-
-            self.accel_cmd.command = 0.0
-            self.accel_pub.publish(self.accel_cmd)
-
-            self.turn_cmd.command = 3
-            self.turn_pub.publish(self.turn_cmd)
-
-            self.get_logger().warn(
-                'Pacmod Disabled: Vehicle enabled and forward gear engaged')
-
-        # ── DISABLE (LB only) — identical to pure_pursuit.py ─
-        elif joy_enable == 0 and self.pacmod_enable:
-            self.global_cmd.enable = False
-            self.global_pub.publish(self.global_cmd)
-
-            self.turn_cmd.command = 1
-            self.turn_pub.publish(self.turn_cmd)
-
-            self.get_logger().warn('Joystick Disabled: Vehicle disabled')
-
-        # ── EXECUTE — pure_pursuit.py structure ───────────────
-        elif joy_enable != 0 and self.pacmod_enable:
-
-            curr_x, curr_y, curr_yaw = self.get_gem_state()
-
-            # No plan yet — hold position, keep PACMod alive
-            if not self.has_plan:
-                self.get_logger().info(
-                    "Waiting for /vlm_goal or /vlm_waypoints...",
-                    throttle_duration_sec=5.0)
-                self.accel_cmd.command = 0.0
-                self.brake_cmd.command = 0.0
-                self.accel_pub.publish(self.accel_cmd)
-                self.brake_pub.publish(self.brake_cmd)
-                self.global_cmd.enable = True
-                self.global_pub.publish(self.global_cmd)
-                self.gear_cmd.command = GEAR_DRIVE
-                self.gear_pub.publish(self.gear_cmd)
-                return
-
-            path_x = np.array([p[0] for p in self.path])
-            path_y = np.array([p[1] for p in self.path])
-            n      = len(self.path)
-
-            # Goal reached check
-            gx, gy = self.goal_xy
-            if math.hypot(curr_x - gx, curr_y - gy) < GOAL_TOL:
-                self.get_logger().info("Goal reached! Stopping.")
-                self.accel_cmd.command = 0.0
-                self.brake_cmd.command = 0.3
-                self.accel_pub.publish(self.accel_cmd)
-                self.brake_pub.publish(self.brake_cmd)
-                self.has_plan = False
-                return
-
-            # Pure pursuit — same logic as pure_pursuit.py,
-            # operating on A* path instead of CSV waypoints
-            dist_arr = np.hypot(path_x - curr_x, path_y - curr_y)
-            closest  = int(np.argmin(dist_arr))
-
-            ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2.0
-
-            self.goal_idx = closest
-            for i in range(closest, n):
-                if dist_arr[i] > ld:
-                    self.goal_idx = i
-                    break
-
-            target_x = path_x[self.goal_idx]
-            target_y = path_y[self.goal_idx]
-
-            alpha     = math.atan2(target_y - curr_y, target_x - curr_x) - curr_yaw
-            curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
-            steering_angle = math.atan(self.wheelbase * curvature)
-            steering_wheel_angle = self.front2steer(math.degrees(steering_angle))
-
-            self.steer_cmd.angular_position = math.radians(steering_wheel_angle)
-            self.steer_pub.publish(self.steer_cmd)
-
-            # Speed control — identical to pure_pursuit.py
-            now         = self.get_clock().now().nanoseconds * 1e-9
-            speed_error = self.desired_speed - self.speed
-            if abs(speed_error) < 0.05:
-                speed_error = 0.0
-            throttle_cmd = self.pid_speed.get_control(now, speed_error)
-            throttle_cmd = max(0.0, min(throttle_cmd, self.max_accel))
-
-            self.accel_cmd.command = throttle_cmd
-            self.brake_cmd.command = 0.0
-            self.accel_pub.publish(self.accel_cmd)
-            self.brake_pub.publish(self.brake_cmd)
-
-            self.global_cmd.enable = True
-            self.global_pub.publish(self.global_cmd)
-
-            self.get_logger().info(
-                f"Pos: ({curr_x:.2f}, {curr_y:.2f}), "
-                f"Target: ({target_x:.2f}, {target_y:.2f}), "
-                f"Speed: {self.speed:.2f}, "
-                f"Throttle: {throttle_cmd:.2f}, "
-                f"Steering: {steering_wheel_angle:.2f}, "
-                f"Dist→Goal: {math.hypot(curr_x-gx, curr_y-gy):.1f}m")
+        self._path_pub.publish(msg)
 
 
 # ═══════════════════════════════════════════════════════════════
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = PlannerNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+def main():
+    PlannerNode()   # _run() blocks; rospy.spin() not needed
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
