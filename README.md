@@ -17,7 +17,7 @@ User command → VLM (GPT-4o) → ENU waypoints → A* on LiDAR costmap → Stan
 | `gazebo_tf_publisher` | `gazebo_tf_publisher.py` | Broadcasts `world → base_footprint` TF at 50 Hz |
 | `lidar_bev_node` | `lidar_bev_node.py` | Builds LiDAR BEV image + `/vlm_costmap` OccupancyGrid at 5 Hz |
 | `vlm_node` | `vlm_node.py` | Queries GPT-4o with RGB + BEV images; outputs locked ENU waypoints |
-| Waypoint visualiser | *(your viz node)* | Displays VLM waypoints in RViz |
+| Waypoint visualiser | `waypoint_viz.py` | Displays VLM waypoints in RViz |
 | `planner_node` | `planner_node.py` | A* on costmap → spline smooth → Stanley controller → `/ackermann_cmd` |
 
 ---
@@ -27,11 +27,6 @@ User command → VLM (GPT-4o) → ENU waypoints → A* on LiDAR costmap → Stan
 ```bash
 # Python dependencies
 pip install pymap3d opencv-python scipy openai
-
-# ROS dependencies (should already be in your workspace)
-# - septentrio_gnss_driver
-# - ackermann_msgs
-# - cv_bridge
 ```
 
 Set your OpenAI API key once per session:
@@ -55,31 +50,20 @@ source devel/setup.bash
 ### Terminal 1 — Gazebo World
 
 ```bash
-roslaunch gazebo_ros empty_world.launch \
-    world_name:=$(rospack find YOUR_PACKAGE)/worlds/high_bay_3d.world \
-    paused:=false \
-    use_sim_time:=true
+roslaunch gem_launch gem_init.launch world_name:="high_bay_3d.world" x:=[START_X] y:=[START Y] yaw:=[START YAW]
 ```
-
-> Replace `YOUR_PACKAGE` with the ROS package that contains your world file.
+> Replace `START_X, START_Y,` and `START_YAW` with the desired coordinates you want your vehicle initialized to
+> `START_X` should be in [-40, 50], and `START_Y` should be in [-5, 12] to ensure the vehicle spawns in the Highbay Lot
 > Wait until Gazebo is fully loaded and the model appears before continuing.
 
 ---
 
 ### Terminal 2 — TF Publisher
 
-Bridges the Gazebo ground-truth pose into the ROS TF tree
-(`world → base_footprint`). Everything downstream depends on this.
-
+Consistently publishes a TF from global to local frame (`world` frame to `base_footprint`)
 ```bash
 python3 gazebo_tf_publisher.py
 ```
-
-Expected output:
-```
-[gazebo_tf] Service ready. Publishing world -> base_footprint at 50Hz
-```
-
 ---
 
 ### Terminal 3 — LiDAR BEV Node
@@ -90,14 +74,9 @@ Publishes `/lidar_bev_image` and `/vlm_costmap`.
 ```bash
 python3 lidar_bev_node.py
 ```
-
-Expected output:
-```
-[lidar_bev] Ready.  BEV: 267px @ 0.15m/px  Range: +/-20m  Grid: 275x157 @ 0.5m/cell
-```
-
 > The costmap must be publishing before the planner starts.
 > Verify with: `rostopic hz /vlm_costmap`
+> You can visualize the costmap in your RViz window as well
 
 ---
 
@@ -109,11 +88,6 @@ a set of ENU waypoints on `/vlm_waypoints`.
 ```bash
 export OPENAI_API_KEY='your-api-key-here'
 python3 vlm_node.py
-```
-
-Expected output:
-```
-[vlm] Ready. One-shot VLM mode. New command = new fixed waypoint set.
 ```
 
 ---
@@ -135,14 +109,6 @@ mid-segment to react to new obstacles.
 ```bash
 python3 planner_node.py
 ```
-
-Expected output:
-```
-[planner] Gazebo service ready.
-[planner] Ready.  Waiting for /vlm_waypoints …
-[planner] Status → idle
-```
-
 ---
 
 ## Sending a Command
@@ -150,20 +116,10 @@ Expected output:
 Once all six nodes are running, issue a navigation command from any terminal:
 
 ```bash
-rostopic pub --once /vlm_command std_msgs/String "data: 'drive to the open space on the left'"
+rostopic pub --once /vlm_command std_msgs/String "data: 'drive forward 10 meters'"
 ```
 
-The stack will respond in sequence:
-
-```
-[vlm]     New command received: 'drive to the open space on the left'
-[vlm]     LOCKED fixed waypoints in 2.3s. status=navigating plan_type=local_goal
-[planner] New VLM waypoints (1). Will replan.
-[planner] Status → planning
-[planner] A*+smooth 0.021s → 250 pts
-[planner] Status → tracking
-[stanley] ef=0.012  θe=1.2°  δ=0.031  spd=2.80
-```
+If waypoints are being visualized in RViz, a yellow sphere should appear along a goal trajectory, and the vehicle should begin moving towards these waypoints.
 
 ---
 
@@ -178,41 +134,7 @@ Add these displays to see what the stack is doing:
 | Image | `/lidar_bev_image` | Top-down LiDAR view |
 | Map | `/vlm_costmap` | Occupancy grid with obstacle inflation |
 
-Set **Fixed Frame** to `world`.
-
----
-
-## Key Parameters
-
-All tunable constants live at the top of each file.
-
-**`lidar_bev_node.py`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `ORIGIN_LAT / LON` | `40.0928381 / -88.2356367` | Must match `<spherical_coordinates>` in world file |
-| `X_MIN/X_MAX/Y_MIN/Y_MAX` | see file | Navigatable zone bounds |
-| `Z_MIN / Z_MAX` | `0.0 / 3.0` | LiDAR height filter |
-| `BEV_RANGE_M` | `20.0` | Metres shown around vehicle in BEV image |
-
-**`vlm_node.py`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `GPT_MODEL` | `gpt-4o` | Vision model used for planning |
-| `MAX_WAYPOINTS` | `5` | Maximum waypoints per VLM call |
-| `ARRIVAL_RADIUS_M` | `2.0` | Radius to declare a waypoint reached |
-
-**`planner_node.py`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `WHEELBASE` | `1.75` m | GEM e4 wheelbase |
-| `SPEED_BASE` | `2.8` m/s | Cruise speed |
-| `INFLATE_CELLS` | `1` | Obstacle inflation (1 cell = 0.5 m) |
-| `REPLAN_INTERVAL_S` | `3.0` s | Mid-segment replan frequency |
-| `WP_ARRIVE_M` | `2.5` m | Intermediate waypoint arrival radius |
-| `FINAL_ARRIVE_M` | `1.5` m | Final goal arrival radius |
+Optional: Set **Fixed Frame** to `world` if global visualization is desired.
 
 ---
 
@@ -238,31 +160,4 @@ Gazebo world-frame coordinates align exactly with ENU (`+X = East, +Y = North`).
 </model>
 ```
 
-The LiDAR will detect any object with height between `Z_MIN=0.0` and `Z_MAX=3.0` m
-and the planner will route around it automatically.
-
----
-
-## Troubleshooting
-
-**Planner says "Already at final goal" immediately**
-The VLM waypoint landed within `FINAL_ARRIVE_M` of the spawn position.
-Check that `ORIGIN_LAT/LON` in all three Python files matches `<spherical_coordinates>`
-in the world file exactly. Run:
-```bash
-rostopic echo /vlm_waypoints
-rostopic echo /gazebo/model_states
-```
-and confirm the coordinates are in the same frame.
-
-**A* fails every cycle**
-The goal cell is inside an inflated obstacle. Reduce `INFLATE_CELLS` from 1 to 0,
-or check that the VLM waypoint is inside the `X_MIN/X_MAX/Y_MIN/Y_MAX` zone.
-
-**No `/vlm_costmap` messages**
-Confirm the LiDAR is publishing: `rostopic hz /ouster/points`.
-The BEV node needs at least one pointcloud before it publishes the costmap.
-
-**VLM node hangs**
-Check your `OPENAI_API_KEY` is exported and valid.
-Set `DRY_RUN = True` in `vlm_node.py` to test the full stack without an API call.
+The planner will route around any obstacles that it may hit (i.e. are at the relevant z-coordinates)
