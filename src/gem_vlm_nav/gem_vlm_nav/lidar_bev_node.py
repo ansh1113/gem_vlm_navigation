@@ -70,7 +70,7 @@ GRID_NC      = int(np.ceil((X_MAX - X_MIN) / GRID_RES_M))   # columns (x)
 GRID_NR      = int(np.ceil((Y_MAX - Y_MIN) / GRID_RES_M))   # rows    (y)
 
 # LiDAR height filter (metres above sensor origin)
-Z_MIN =  0   # ignore ground returns below this
+Z_MIN =  -1.5   # ignore ground returns below this
 Z_MAX =  3.00   # ignore ceiling / overhead structure above this
 
 # GEM e4 footprint for BEV overlay
