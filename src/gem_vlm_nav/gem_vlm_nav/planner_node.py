@@ -96,8 +96,8 @@ WP_ARRIVE_M       = 2.5    # metres — advance to next VLM waypoint
 FINAL_ARRIVE_M    = 1.5    # metres — declare "arrived" at final goal
 
 # A* / costmap
-INFLATE_CELLS     = 1      # obstacle inflation in grid cells (1 cell = 0.5 m)
-YAW_PENALTY       = 2.0    # A* turn-cost weight (from reference planner)
+INFLATE_CELLS     = 2      # obstacle inflation in grid cells (1 cell = 0.5 m)
+YAW_PENALTY       = 6.0    # A* turn-cost weight (from reference planner)
 SPLINE_POINTS     = 250    # output points from splprep smoother
 REPLAN_INTERVAL_S = 3.0    # replan mid-segment every N seconds while tracking
 
