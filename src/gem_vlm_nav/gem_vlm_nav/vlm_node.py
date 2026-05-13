@@ -1,45 +1,20 @@
 #!/usr/bin/env python3
 """
-vlm_node.py — Closed-Loop VLM Receding-Horizon Navigation Planner
-==================================================================
-Runs GPT-4o (vision) in a background thread at ~0.2Hz.
+vlm_node.py — One-Shot VLM High-Level Waypoint Generator
+========================================================
 
-Each cycle the VLM receives:
-  [1] Front RGB camera image
-  [2] LiDAR BEV top-down image (from lidar_bev_node)
-  [3] Current vehicle position + heading (text)
-  [4] Original user command (cached from first call)
-  [5] Current status + last reasoning (continuity between cycles)
+Behavior:
+  - User sends /vlm_command.
+  - VLM runs ONCE for that command.
+  - VLM outputs high-level intent:
+      local_goal / map_goal / world_goal / arrived
+  - Node converts that intent into fixed ENU world-frame waypoints.
+  - Waypoints are LOCKED and repeatedly republished.
+  - The VLM does NOT update the waypoint as the car moves.
+  - A new /vlm_command clears the old goal and runs the VLM once again.
 
-The VLM outputs a JSON plan:
-  {
-    "status":    "searching" | "navigating" | "arrived",
-    "reasoning": "<brief explanation of what the VLM sees>",
-    "waypoints": [{"x": float, "y": float}, ...]   // 2-4 ENU map coords
-  }
-
-Waypoints are passed through a kinematic feasibility filter
-(min turning radius, min spacing) before publishing.
-
-The plan is published to /vlm_waypoints where planner_node
-immediately preempts its current path and replans toward
-waypoint[0] using A* on the live costmap.
-
-DRY_RUN mode: set DRY_RUN=True to bypass API calls during
-development. Returns a hardcoded JSON so you can test the
-full pipeline without spending API credits.
-
-Topics (in):
-  /oak/rgb/image_raw   — Front RGB camera
-  /lidar_bev_image     — BEV image from lidar_bev_node
-  /navsatfix           — GNSS position
-  /insnavgeod          — INS heading
-  /vlm_command         — User command string (String)
-
-Topics (out):
-  /vlm_waypoints       — WaypointArray (geometry_msgs/PoseArray)
-                         Each pose.position.x/y is an ENU waypoint
-  /vlm_status          — String: searching|navigating|arrived|waiting
+This prevents the "moving carrot" problem where local goals keep shifting with
+the car's updated pose.
 """
 
 import math
@@ -47,160 +22,334 @@ import base64
 import json
 import threading
 import time
-import numpy as np
+import re
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+import rospy
+import numpy as np
+import cv2
+import pymap3d as pm
+
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseArray, Pose
 from septentrio_gnss_driver.msg import INSNavGeod
 from cv_bridge import CvBridge
-import cv2
-import pymap3d as pm
-from openai import OpenAI
+
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION
+# CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-ORIGIN_LAT = 40.0927422
-ORIGIN_LON = -88.2359639
+ORIGIN_LAT = 40.0928381
+ORIGIN_LON = -88.2356367
 
-# Operating area bounds (ENU meters)
-X_MIN, X_MAX = -25.0, 75.0
-Y_MIN, Y_MAX =  -5.0, 20.0
+X_MIN = -50
+X_MAX =  40
+Y_MIN = -12
+Y_MAX =  5
 
-# GEM e4 kinematic limits
-WHEELBASE    = 2.57   # m
-MAX_STEER    = 0.6    # rad
-SPEED        = 2.0    # m/s
+WHEELBASE = 2.57
+MAX_STEER = 0.6
+MIN_TURN_R = WHEELBASE / math.tan(MAX_STEER)
 
-# Minimum turning radius = L / tan(max_steer) ≈ 3.76m
-MIN_TURN_R   = WHEELBASE / math.tan(MAX_STEER)   # ~3.76m
+MIN_WP_DIST = MIN_TURN_R + 0.5
+MAX_WP_DIST = 18.0
+MIN_WP_SEP = 3.0
+MAX_WAYPOINTS = 5
 
-# Waypoint constraints for kinematic feasibility
-MIN_WP_DIST  = MIN_TURN_R + 0.5   # min distance to each waypoint (m)
-MAX_WP_DIST  = 25.0               # max lookahead per waypoint (m)
-MIN_WP_SEP   = 4.0                # min separation between consecutive waypoints (m)
-MAX_WAYPOINTS = 4                 # max waypoints per VLM cycle
+REPUBLISH_HZ = 10.0
 
-# VLM cycle rate
-VLM_HZ = 0.2          # ~1 call per 5 seconds
+GPT_MODEL = "gpt-4o"
+GPT_MAX_TOK = 500
+RGB_DETAIL = "high"
+BEV_DETAIL = "high"
 
-# GPT model
-GPT_MODEL    = "gpt-4o"
-GPT_MAX_TOK  = 300    # keep output short — JSON only
-IMAGE_DETAIL = "low"  # low detail = cheaper (~85 tokens/image vs ~1700)
+DRY_RUN = False
 
-# Set True during development to skip API calls
-DRY_RUN = True
+MAP_MARGIN = 5.0
+ARRIVAL_RADIUS_M = 2.0
 
-# Dry run returns this hardcoded response for pipeline testing
-DRY_RUN_RESPONSE = {
-    "status": "navigating",
-    "reasoning": "DRY RUN: cone assumed at (20, 8). Moving toward it.",
-    "waypoints": [
-        {"x": 10.0, "y": 5.0},
-        {"x": 20.0, "y": 8.0}
-    ]
-}
 
-# System prompt — tells GPT its role and output format
-SYSTEM_PROMPT = """You are the high-level navigation planner for an autonomous vehicle \
-(GEM e4 electric car) operating in a university parking lot.
+SYSTEM_PROMPT = f"""
+You are a high-level VLM navigation controller for a GEM e4 autonomous vehicle.
 
-You receive two images every cycle:
-  IMAGE 1: Front RGB camera — what the vehicle sees ahead
-  IMAGE 2: LiDAR Bird's-Eye-View — top-down map, vehicle at center pointing UP, \
-obstacles shown as bright points, distance rings at 5m and 10m
+You receive:
+1. Front RGB camera image.
+2. LiDAR BEV image.
+3. Vehicle pose in ENU world coordinates.
+4. User command.
+5. Map bounds.
 
-Your job: given the user's navigation command, decide where the vehicle should \
-drive next and output a short sequence of waypoints in the map's ENU coordinate \
-frame (x=East meters, y=North meters from origin).
+Coordinate facts:
+- ENU world frame: x = East, y = North.
+- Vehicle yaw is given in ENU.
+- Vehicle forward and left vectors are explicitly given.
+- The LiDAR BEV image is vehicle-centered.
+- In the BEV image, the vehicle is at the center and vehicle-forward is UP.
+- The BEV image is NOT north-up.
+- Map bounds:
+  x in [{X_MIN:.2f}, {X_MAX:.2f}]
+  y in [{Y_MIN:.2f}, {Y_MAX:.2f}]
+
+You are a HIGH-LEVEL controller. Choose the next navigation intent.
+
+You MUST output only valid JSON.
+
+Allowed schemas:
+
+1. local_goal
+Use for perception-heavy commands:
+"drive up to this cone", "go next to that object", "move toward the opening".
+
+{{
+  "status": "searching" | "navigating",
+  "plan_type": "local_goal",
+  "reasoning": "...",
+  "local_goal": {{
+    "forward_m": number,
+    "left_m": number,
+    "stop_distance_m": number
+  }}
+}}
+
+Meaning:
+- forward_m > 0 is ahead of the vehicle.
+- left_m > 0 is left of the vehicle.
+- Choose a single fixed local target relative to the CURRENT vehicle pose.
+- Keep forward_m between 4 and 18.
+- Keep left_m between -10 and 10.
+
+2. map_goal
+Use for global map commands:
+"top-left corner", "upper right", "center", "north side", etc.
+
+{{
+  "status": "navigating",
+  "plan_type": "map_goal",
+  "reasoning": "...",
+  "map_goal": "top_left" | "top_right" | "bottom_left" | "bottom_right" |
+              "top" | "bottom" | "left" | "right" | "center"
+}}
+
+Interpretation:
+- top = high y / north.
+- bottom = low y / south.
+- left = low x / west.
+- right = high x / east.
+
+3. world_goal
+Use only if confident about a specific ENU coordinate.
+
+{{
+  "status": "navigating",
+  "plan_type": "world_goal",
+  "reasoning": "...",
+  "world_goal": {{
+    "x": number,
+    "y": number
+  }}
+}}
+
+4. arrived
+
+{{
+  "status": "arrived",
+  "plan_type": "arrived",
+  "reasoning": "...",
+  "waypoints": []
+}}
 
 Rules:
-- Output ONLY valid JSON, no explanation outside the JSON
-- Waypoints must be reachable given a car turning radius of 3.8m
-- Space waypoints at least 4m apart
-- Maximum 4 waypoints per response
-- If the goal object is not visible, output waypoints to explore or reposition \
-  the vehicle to improve visibility (e.g. turn around, move to open area)
-- If the vehicle has arrived within 2m of the goal, set status to "arrived"
-- Keep reasoning under 2 sentences
-
-Output format:
-{
-  "status": "searching" | "navigating" | "arrived",
-  "reasoning": "<what you see and why you chose these waypoints>",
-  "waypoints": [{"x": <float>, "y": <float>}, ...]
-}"""
+- Prefer local_goal for visible-object tasks.
+- Prefer map_goal for map/corner/direction tasks.
+- Do not output moving/tracking behavior.
+- This VLM call happens once; choose a fixed goal.
+- Keep reasoning under 2 sentences.
+"""
 
 
 # ═══════════════════════════════════════════════════════════════
-#  UTILITIES
+# HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 def ins_heading_to_yaw(h: float) -> float:
     return math.radians(90.0 - h) if h < 270.0 else math.radians(450.0 - h)
 
+
 def img_to_base64(cv_img: np.ndarray) -> str:
-    """Encode OpenCV BGR image to base64 JPEG string for GPT-4o."""
-    _, buf = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return base64.b64encode(buf.tobytes()).decode('utf-8')
+    _, buf = cv2.imencode(".jpg", cv_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  KINEMATIC FEASIBILITY FILTER
-# ═══════════════════════════════════════════════════════════════
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-def filter_waypoints(raw_waypoints: list,
-                     car_x: float, car_y: float,
-                     car_yaw: float) -> list:
-    """
-    Filter VLM-output waypoints for kinematic feasibility.
 
-    Checks:
-      1. Each waypoint is within lot bounds
-      2. Distance from current position >= MIN_WP_DIST (turning radius)
-      3. Consecutive waypoints are spaced >= MIN_WP_SEP apart
-      4. No more than MAX_WAYPOINTS returned
+def normalize_angle(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
-    Waypoints that fail are dropped (not corrected) — the VLM will
-    regenerate better ones on the next cycle.
-    """
+
+def clamp_to_bounds(x, y, margin=2.0):
+    return (
+        clamp(x, X_MIN + margin, X_MAX - margin),
+        clamp(y, Y_MIN + margin, Y_MAX - margin),
+    )
+
+
+def local_to_world(car_x, car_y, car_yaw, forward_m, left_m):
+    fwd_x = math.cos(car_yaw)
+    fwd_y = math.sin(car_yaw)
+
+    left_x = -math.sin(car_yaw)
+    left_y = math.cos(car_yaw)
+
+    wx = car_x + forward_m * fwd_x + left_m * left_x
+    wy = car_y + forward_m * fwd_y + left_m * left_y
+
+    return wx, wy
+
+
+def map_goal_to_world(goal_name):
+    gx_mid = 0.5 * (X_MIN + X_MAX)
+    gy_mid = 0.5 * (Y_MIN + Y_MAX)
+
+    west = X_MIN + MAP_MARGIN
+    east = X_MAX - MAP_MARGIN
+    south = Y_MIN + MAP_MARGIN
+    north = Y_MAX - MAP_MARGIN
+
+    table = {
+        "top_left":     (west, north),
+        "top_right":    (east, north),
+        "bottom_left":  (west, south),
+        "bottom_right": (east, south),
+        "top":          (gx_mid, north),
+        "bottom":       (gx_mid, south),
+        "left":         (west, gy_mid),
+        "right":        (east, gy_mid),
+        "center":       (gx_mid, gy_mid),
+    }
+
+    return table.get(goal_name, (gx_mid, gy_mid))
+
+
+def extract_json(text):
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    return json.loads(m.group(0))
+
+
+def clamp_local_goal_to_feasible(forward_m, left_m):
+    forward_m = clamp(forward_m, MIN_WP_DIST, MAX_WP_DIST)
+
+    max_left = 0.45 * forward_m
+    left_m = clamp(left_m, -max_left, max_left)
+
+    return forward_m, left_m
+
+
+def build_waypoints_to_goal(car_x, car_y, car_yaw, goal_x, goal_y):
+    goal_x, goal_y = clamp_to_bounds(goal_x, goal_y)
+
+    dx = goal_x - car_x
+    dy = goal_y - car_y
+    dist = math.hypot(dx, dy)
+
+    if dist < ARRIVAL_RADIUS_M:
+        return []
+
+    heading_to_goal = math.atan2(dy, dx)
+    heading_err = normalize_angle(heading_to_goal - car_yaw)
+
+    waypoints = []
+
+    if abs(heading_err) > math.radians(100):
+        turn_sign = 1.0 if heading_err > 0 else -1.0
+        wx1, wy1 = local_to_world(car_x, car_y, car_yaw, 7.0, turn_sign * 4.0)
+        wx1, wy1 = clamp_to_bounds(wx1, wy1)
+        waypoints.append({"x": wx1, "y": wy1})
+        prev_x, prev_y = wx1, wy1
+    else:
+        prev_x, prev_y = car_x, car_y
+
+    remaining = math.hypot(goal_x - prev_x, goal_y - prev_y)
+    if remaining < 1e-6:
+        return waypoints
+
+    steps = int(math.ceil(remaining / MAX_WP_DIST))
+    steps = max(1, min(steps, MAX_WAYPOINTS - len(waypoints)))
+
+    for i in range(1, steps + 1):
+        t = float(i) / float(steps)
+        wx = prev_x + t * (goal_x - prev_x)
+        wy = prev_y + t * (goal_y - prev_y)
+        wx, wy = clamp_to_bounds(wx, wy)
+
+        if waypoints:
+            sep = math.hypot(wx - waypoints[-1]["x"], wy - waypoints[-1]["y"])
+        else:
+            sep = math.hypot(wx - car_x, wy - car_y)
+
+        if sep >= MIN_WP_SEP or i == steps:
+            waypoints.append({"x": wx, "y": wy})
+
+        if len(waypoints) >= MAX_WAYPOINTS:
+            break
+
+    return waypoints
+
+
+def filter_waypoints(raw_waypoints, car_x, car_y):
     filtered = []
     prev_x, prev_y = car_x, car_y
 
     for wp in raw_waypoints:
-        wx = float(wp.get('x', 0.0))
-        wy = float(wp.get('y', 0.0))
-
-        # Bounds check
-        if not (X_MIN + 2 < wx < X_MAX - 2 and Y_MIN + 2 < wy < Y_MAX - 2):
+        try:
+            wx = float(wp["x"])
+            wy = float(wp["y"])
+        except Exception:
             continue
 
-        # Distance from previous point (car pos for first wp)
+        wx, wy = clamp_to_bounds(wx, wy)
         sep = math.hypot(wx - prev_x, wy - prev_y)
 
-        if len(filtered) == 0:
-            # First waypoint: must be reachable given turning radius
-            if sep < MIN_WP_DIST:
+        if len(filtered) == 0 and sep < MIN_WP_DIST:
+            if sep < 1e-3:
                 continue
-        else:
-            # Subsequent waypoints: must be spaced reasonably
-            if sep < MIN_WP_SEP:
-                continue
+            scale = MIN_WP_DIST / sep
+            wx = prev_x + (wx - prev_x) * scale
+            wy = prev_y + (wy - prev_y) * scale
+            wx, wy = clamp_to_bounds(wx, wy)
+            sep = math.hypot(wx - prev_x, wy - prev_y)
 
-        # Max distance cap — don't send car across the entire lot in one step
+        if len(filtered) > 0 and sep < MIN_WP_SEP:
+            continue
+
         if sep > MAX_WP_DIST:
-            # Clip to MAX_WP_DIST along same direction
-            angle = math.atan2(wy - prev_y, wx - prev_x)
-            wx = prev_x + MAX_WP_DIST * math.cos(angle)
-            wy = prev_y + MAX_WP_DIST * math.sin(angle)
+            ang = math.atan2(wy - prev_y, wx - prev_x)
+            wx = prev_x + MAX_WP_DIST * math.cos(ang)
+            wy = prev_y + MAX_WP_DIST * math.sin(ang)
+            wx, wy = clamp_to_bounds(wx, wy)
 
-        filtered.append({'x': wx, 'y': wy})
+        filtered.append({"x": wx, "y": wy})
         prev_x, prev_y = wx, wy
 
         if len(filtered) >= MAX_WAYPOINTS:
@@ -210,270 +359,405 @@ def filter_waypoints(raw_waypoints: list,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  NODE
+# NODE
 # ═══════════════════════════════════════════════════════════════
 
-class VLMNode(Node):
+class VLMNode:
     def __init__(self):
-        super().__init__('vlm_node')
+        rospy.init_node("vlm_node", anonymous=False)
 
-        # Sensor state
-        self.bridge        = CvBridge()
-        self.latest_rgb    = None
-        self.latest_bev    = None
-        self.car_x         = None
-        self.car_y         = None
-        self.car_yaw       = 0.0
-        self.car_heading   = 0.0   # raw degrees
+        self.bridge = CvBridge()
 
-        # Mission state
-        self.command       = None   # cached from /vlm_command
-        self.last_status   = "waiting"
+        self.latest_rgb = None
+        self.latest_bev = None
+
+        self.car_x = None
+        self.car_y = None
+        self.car_yaw = 0.0
+        self.car_heading = 0.0
+
+        self.command = None
+        self.last_status = "waiting"
         self.last_reasoning = ""
-        self._lock         = threading.Lock()
+        self.last_plan_type = "none"
 
-        # GPT client
+        self.goal_locked = False
+        self.locked_waypoints = []
+        self.latest_valid_wps = []
+
+        self._wp_lock = threading.Lock()
+        self._vlm_running = False
+
         if not DRY_RUN:
-            self.client = OpenAI()   # reads OPENAI_API_KEY from env
+            from openai import OpenAI
+            self.client = OpenAI()
         else:
             self.client = None
-            self.get_logger().warn(
-                "DRY_RUN mode enabled — GPT-4o calls are skipped.")
+            rospy.logwarn("[vlm] DRY_RUN=True")
 
-        # ── Subscriptions ──────────────────────────────────────
-        self.create_subscription(
-            Image, '/oak/rgb/image_raw', self.rgb_cb, 10)
-        # NOTE: try /oak/color/image_raw if above is missing on live vehicle
+        rospy.Subscriber("/oak/rgb/image_raw", Image, self.rgb_cb, queue_size=1)
+        rospy.Subscriber("/lidar_bev_image", Image, self.bev_cb, queue_size=1)
+        rospy.Subscriber("/gps/fix", NavSatFix, self.gps_cb, queue_size=1)
+        rospy.Subscriber("/septentrio_gnss/insnavgeod", INSNavGeod, self.ins_cb, queue_size=1)
+        rospy.Subscriber("/vlm_command", String, self.command_cb, queue_size=1)
 
-        self.create_subscription(
-            Image, '/lidar_bev_image', self.bev_cb, 10)
+        self.wp_pub = rospy.Publisher("/vlm_waypoints", PoseArray, queue_size=1, latch=True)
+        self.status_pub = rospy.Publisher("/vlm_status", String, queue_size=1, latch=True)
 
-        self.create_subscription(
-            NavSatFix, '/navsatfix', self.gps_cb, 10)
+        rospy.Timer(rospy.Duration(1.0 / REPUBLISH_HZ), self._republish_cb)
 
-        self.create_subscription(
-            INSNavGeod, '/insnavgeod', self.ins_cb, 10)
+        rospy.loginfo("[vlm] Ready. One-shot VLM mode. New command = new fixed waypoint set.")
 
-        # Command — TRANSIENT_LOCAL so we don't miss it if published before node starts
-        qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(
-            String, '/vlm_command', self.command_cb, qos)
-
-        # ── Publishers ─────────────────────────────────────────
-        wp_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.wp_pub     = self.create_publisher(PoseArray, '/vlm_waypoints', wp_qos)
-        self.status_pub = self.create_publisher(String,    '/vlm_status',    10)
-
-        # ── VLM timer ──────────────────────────────────────────
-        # Timer triggers the VLM cycle — actual inference runs in a thread
-        # so we never block the ROS executor
-        self._vlm_running = False
-        self.create_timer(1.0 / VLM_HZ, self._vlm_timer_cb)
-
-        self.get_logger().info(
-            f"VLM node ready. DRY_RUN={DRY_RUN}  "
-            f"Model={GPT_MODEL}  Rate={VLM_HZ}Hz  "
-            f"MIN_TURN_R={MIN_TURN_R:.2f}m  "
-            "Publish /vlm_command to start.")
-
-    # ── Sensor callbacks ──────────────────────────────────────
-
-    def rgb_cb(self, msg: Image):
+    def rgb_cb(self, msg):
         self.latest_rgb = msg
 
-    def bev_cb(self, msg: Image):
+    def bev_cb(self, msg):
         self.latest_bev = msg
 
-    def gps_cb(self, msg: NavSatFix):
+    def gps_cb(self, msg):
         try:
             e, n, _ = pm.geodetic2enu(
-                msg.latitude, msg.longitude, 0,
-                ORIGIN_LAT, ORIGIN_LON, 0)
-            self.car_x, self.car_y = float(e), float(n)
-        except Exception:
-            pass
+                msg.latitude,
+                msg.longitude,
+                0,
+                ORIGIN_LAT,
+                ORIGIN_LON,
+                0
+            )
+            self.car_x = float(e)
+            self.car_y = float(n)
+        except Exception as ex:
+            rospy.logwarn_throttle(5.0, "[vlm] GPS conversion failed: %s", str(ex))
 
-    def ins_cb(self, msg: INSNavGeod):
+    def ins_cb(self, msg):
         if msg.heading is not None and not math.isnan(msg.heading):
-            self.car_heading = msg.heading
-            self.car_yaw     = ins_heading_to_yaw(msg.heading)
+            self.car_heading = float(msg.heading)
+            self.car_yaw = ins_heading_to_yaw(self.car_heading)
 
-    def command_cb(self, msg: String):
+    def command_cb(self, msg):
         cmd = msg.data.strip()
-        if cmd:
-            self.command      = cmd
-            self.last_status  = "searching"
-            self.last_reasoning = ""
-            self.get_logger().info(f"Command received: '{cmd}'")
-
-    # ── VLM timer ─────────────────────────────────────────────
-
-    def _vlm_timer_cb(self):
-        """
-        Called at VLM_HZ. Launches VLM inference in a background thread
-        so the ROS executor is never blocked.
-        """
-        if self.command is None:
+        if not cmd:
             return
-        if self.last_status == "arrived":
-            return
+
+        rospy.loginfo("[vlm] New command received: '%s'. Clearing old locked goal.", cmd)
+
+        self.command = cmd
+        self.last_status = "searching"
+        self.last_reasoning = ""
+        self.last_plan_type = "none"
+
+        with self._wp_lock:
+            self.goal_locked = False
+            self.locked_waypoints = []
+            self.latest_valid_wps = []
+
+        self._publish_status("searching")
+        self._start_vlm_thread_once()
+
+    def _publish_status(self, status):
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    def _republish_cb(self, _event):
+        with self._wp_lock:
+            wps = list(self.latest_valid_wps)
+
+        pa = PoseArray()
+        pa.header.stamp = rospy.Time.now()
+        pa.header.frame_id = "world"
+
+        for wp in wps:
+            p = Pose()
+            p.position.x = float(wp["x"])
+            p.position.y = float(wp["y"])
+            p.position.z = 0.0
+            p.orientation.w = 1.0
+            pa.poses.append(p)
+
+        self.wp_pub.publish(pa)
+
+    def _start_vlm_thread_once(self):
         if self._vlm_running:
-            # Previous call still in flight — skip this cycle
-            self.get_logger().debug("VLM: previous call still running, skipping.")
-            return
-        if self.car_x is None:
-            self.get_logger().warn("VLM: waiting for GPS lock.")
-            return
-        if self.latest_rgb is None or self.latest_bev is None:
-            self.get_logger().warn("VLM: waiting for camera/BEV images.")
+            rospy.logwarn("[vlm] VLM already running; ignoring duplicate trigger.")
             return
 
-        # Snapshot current sensor state (thread-safe copies)
-        rgb_msg    = self.latest_rgb
-        bev_msg    = self.latest_bev
-        car_x      = self.car_x
-        car_y      = self.car_y
-        car_yaw    = self.car_yaw
-        car_heading = self.car_heading
-        command    = self.command
-        last_status    = self.last_status
-        last_reasoning = self.last_reasoning
+        with self._wp_lock:
+            if self.goal_locked:
+                rospy.loginfo("[vlm] Goal already locked; not running VLM again.")
+                return
+
+        if self.car_x is None or self.car_y is None:
+            rospy.logwarn("[vlm] Waiting for GPS/ENU pose before VLM call.")
+            return
+
+        if self.latest_rgb is None:
+            rospy.logwarn("[vlm] Waiting for RGB image before VLM call.")
+            return
+
+        if self.latest_bev is None:
+            rospy.logwarn("[vlm] Waiting for BEV image before VLM call.")
+            return
 
         self._vlm_running = True
-        t = threading.Thread(
-            target=self._vlm_inference,
-            args=(rgb_msg, bev_msg, car_x, car_y,
-                  car_yaw, car_heading, command,
-                  last_status, last_reasoning),
-            daemon=True)
-        t.start()
 
-    # ── VLM inference (background thread) ────────────────────
+        args = (
+            self.latest_rgb,
+            self.latest_bev,
+            self.car_x,
+            self.car_y,
+            self.car_yaw,
+            self.car_heading,
+            self.command,
+        )
 
-    def _vlm_inference(self, rgb_msg, bev_msg,
-                       car_x, car_y, car_yaw, car_heading,
-                       command, last_status, last_reasoning):
-        t0 = time.time()
-        try:
-            # Convert ROS images to OpenCV
-            rgb_cv = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
-            bev_cv = self.bridge.imgmsg_to_cv2(bev_msg, 'bgr8')
+        threading.Thread(target=self._vlm_inference, args=args, daemon=True).start()
 
-            # Encode to base64
-            rgb_b64 = img_to_base64(rgb_cv)
-            bev_b64 = img_to_base64(bev_cv)
+    def _make_user_text(self, car_x, car_y, car_yaw, car_heading, command):
+        fwd_x = math.cos(car_yaw)
+        fwd_y = math.sin(car_yaw)
+        left_x = -math.sin(car_yaw)
+        left_y = math.cos(car_yaw)
 
-            # Build user message
-            user_text = (
-                f"Command: \"{command}\"\n"
-                f"Vehicle position: x={car_x:.1f}m, y={car_y:.1f}m, "
-                f"heading={car_heading:.1f}° ({math.degrees(car_yaw):.1f}° ENU yaw)\n"
-                f"Current status: {last_status}\n"
-                f"Last reasoning: {last_reasoning if last_reasoning else 'none yet'}\n\n"
-                f"Image 1 (front camera) and Image 2 (LiDAR BEV, vehicle at centre "
-                f"pointing UP, rings at 5m and 10m) are attached.\n"
-                f"Output your JSON plan now."
+        return f"""
+Command: "{command}"
+
+Current vehicle state:
+- ENU position: x={car_x:.2f}, y={car_y:.2f}
+- INS heading: {car_heading:.2f} deg
+- ENU yaw: {math.degrees(car_yaw):.2f} deg
+- Forward vector: dx={fwd_x:.4f}, dy={fwd_y:.4f}
+- Left vector: dx={left_x:.4f}, dy={left_y:.4f}
+
+Formula:
+A local goal F meters forward and L meters left becomes:
+x = {car_x:.2f} + F*{fwd_x:.4f} + L*{left_x:.4f}
+y = {car_y:.2f} + F*{fwd_y:.4f} + L*{left_y:.4f}
+
+Map:
+- x_min={X_MIN:.2f}, x_max={X_MAX:.2f}
+- y_min={Y_MIN:.2f}, y_max={Y_MAX:.2f}
+- top/north = high y
+- bottom/south = low y
+- left/west = low x
+- right/east = high x
+
+Images:
+- Image 1 is front RGB.
+- Image 2 is LiDAR BEV.
+- The BEV is vehicle-centered: car at center, forward is up.
+- The BEV is not north-up.
+
+Important:
+This is a ONE-SHOT call. Choose a fixed goal from the current pose.
+The waypoint will not update as the vehicle moves.
+
+Output only valid JSON.
+"""
+
+    def _call_vlm(self, rgb_msg, bev_msg, car_x, car_y, car_yaw, car_heading, command):
+        rgb_cv = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        bev_cv = self.bridge.imgmsg_to_cv2(bev_msg, "bgr8")
+
+        rgb_b64 = img_to_base64(rgb_cv)
+        bev_b64 = img_to_base64(bev_cv)
+
+        user_text = self._make_user_text(
+            car_x,
+            car_y,
+            car_yaw,
+            car_heading,
+            command,
+        )
+
+        response = self.client.chat.completions.create(
+            model=GPT_MODEL,
+            max_tokens=GPT_MAX_TOK,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{rgb_b64}",
+                                "detail": RGB_DETAIL,
+                            },
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{bev_b64}",
+                                "detail": BEV_DETAIL,
+                            },
+                        },
+                    ],
+                },
+            ],
+        )
+
+        raw = response.choices[0].message.content.strip()
+        result = extract_json(raw)
+        return result, raw
+
+    def _interpret_vlm_result(self, result, car_x, car_y, car_yaw):
+        status = result.get("status", "searching")
+        plan_type = result.get("plan_type", "local_goal")
+        reasoning = result.get("reasoning", "")
+
+        if status == "arrived" or plan_type == "arrived":
+            return "arrived", "arrived", reasoning, []
+
+        if plan_type == "map_goal":
+            goal_name = str(result.get("map_goal", "center")).strip().lower()
+            goal_x, goal_y = map_goal_to_world(goal_name)
+
+            rospy.loginfo(
+                "[vlm] map_goal=%s -> fixed world goal (%.2f, %.2f)",
+                goal_name,
+                goal_x,
+                goal_y,
             )
 
+            wps = build_waypoints_to_goal(car_x, car_y, car_yaw, goal_x, goal_y)
+            return status, plan_type, reasoning, wps
+
+        if plan_type == "world_goal":
+            wg = result.get("world_goal", {})
+            goal_x = float(wg.get("x", car_x))
+            goal_y = float(wg.get("y", car_y))
+            goal_x, goal_y = clamp_to_bounds(goal_x, goal_y)
+
+            rospy.loginfo(
+                "[vlm] world_goal -> fixed clipped world goal (%.2f, %.2f)",
+                goal_x,
+                goal_y,
+            )
+
+            wps = build_waypoints_to_goal(car_x, car_y, car_yaw, goal_x, goal_y)
+            return status, plan_type, reasoning, wps
+
+        lg = result.get("local_goal", {})
+
+        forward_m = float(lg.get("forward_m", 8.0))
+        left_m = float(lg.get("left_m", 0.0))
+
+        forward_m, left_m = clamp_local_goal_to_feasible(forward_m, left_m)
+
+        goal_x, goal_y = local_to_world(car_x, car_y, car_yaw, forward_m, left_m)
+        goal_x, goal_y = clamp_to_bounds(goal_x, goal_y)
+
+        rospy.loginfo(
+            "[vlm] local_goal F=%.2f L=%.2f -> fixed world goal (%.2f, %.2f)",
+            forward_m,
+            left_m,
+            goal_x,
+            goal_y,
+        )
+
+        wps = build_waypoints_to_goal(car_x, car_y, car_yaw, goal_x, goal_y)
+        return status, "local_goal", reasoning, wps
+
+    def _vlm_inference(self, rgb_msg, bev_msg, car_x, car_y, car_yaw, car_heading, command):
+        t0 = time.time()
+
+        try:
             if DRY_RUN:
-                result = DRY_RUN_RESPONSE
-                self.get_logger().info(
-                    f"[DRY RUN] Skipping GPT call. "
-                    f"Returning hardcoded response.")
+                result = {
+                    "status": "navigating",
+                    "plan_type": "local_goal",
+                    "reasoning": "DRY RUN fixed local goal.",
+                    "local_goal": {
+                        "forward_m": 10.0,
+                        "left_m": 0.0,
+                        "stop_distance_m": 0.0,
+                    },
+                }
+                raw = json.dumps(result)
             else:
-                response = self.client.chat.completions.create(
-                    model=GPT_MODEL,
-                    max_tokens=GPT_MAX_TOK,
-                    temperature=0.2,   # low temp = consistent spatial reasoning
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": user_text},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{rgb_b64}",
-                                "detail": IMAGE_DETAIL}},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{bev_b64}",
-                                "detail": IMAGE_DETAIL}},
-                        ]}
-                    ]
+                result, raw = self._call_vlm(
+                    rgb_msg,
+                    bev_msg,
+                    car_x,
+                    car_y,
+                    car_yaw,
+                    car_heading,
+                    command,
                 )
-                raw_text = response.choices[0].message.content.strip()
-                # Strip markdown fences if GPT wraps in ```json ... ```
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.split("```")[1]
-                    if raw_text.startswith("json"):
-                        raw_text = raw_text[4:]
-                result = json.loads(raw_text)
 
-            elapsed = time.time() - t0
-            self.get_logger().info(
-                f"VLM [{elapsed:.1f}s] "
-                f"status={result.get('status')}  "
-                f"reasoning='{result.get('reasoning', '')[:80]}'  "
-                f"waypoints={len(result.get('waypoints', []))}")
+            rospy.loginfo("[vlm] Raw VLM JSON: %s", json.dumps(result))
 
-            # Update status
-            self.last_status    = result.get('status', 'searching')
-            self.last_reasoning = result.get('reasoning', '')
+            status, plan_type, reasoning, raw_wps = self._interpret_vlm_result(
+                result,
+                car_x,
+                car_y,
+                car_yaw,
+            )
 
-            # Publish status string
-            status_msg = String()
-            status_msg.data = self.last_status
-            self.status_pub.publish(status_msg)
+            valid_wps = filter_waypoints(raw_wps, car_x, car_y)
 
-            if self.last_status == "arrived":
-                self.get_logger().info("VLM: ARRIVED at goal!")
+            self.last_status = status
+            self.last_plan_type = plan_type
+            self.last_reasoning = reasoning
+
+            self._publish_status(status)
+
+            if status == "arrived":
+                with self._wp_lock:
+                    self.goal_locked = True
+                    self.locked_waypoints = []
+                    self.latest_valid_wps = []
+                rospy.loginfo("[vlm] ARRIVED: %s", reasoning)
                 return
-
-            # Kinematic feasibility filter
-            raw_wps   = result.get('waypoints', [])
-            valid_wps = filter_waypoints(raw_wps, car_x, car_y, car_yaw)
 
             if not valid_wps:
-                self.get_logger().warn(
-                    f"VLM returned {len(raw_wps)} waypoints but "
-                    f"0 passed kinematic filter. Skipping publish.")
+                rospy.logwarn(
+                    "[vlm] No valid waypoints from plan_type=%s. Goal not locked.",
+                    plan_type,
+                )
+                self._publish_status("searching")
                 return
 
-            # Publish as PoseArray — planner reads pose.position.x/y
-            pa = PoseArray()
-            pa.header.stamp    = self.get_clock().now().to_msg()
-            pa.header.frame_id = 'map'
-            for wp in valid_wps:
-                p = Pose()
-                p.position.x = float(wp['x'])
-                p.position.y = float(wp['y'])
-                p.position.z = 0.0
-                p.orientation.w = 1.0
-                pa.poses.append(p)
-            self.wp_pub.publish(pa)
+            with self._wp_lock:
+                self.locked_waypoints = list(valid_wps)
+                self.latest_valid_wps = list(valid_wps)
+                self.goal_locked = True
 
-            self.get_logger().info(
-                f"Published {len(valid_wps)} waypoints "
-                f"(filtered from {len(raw_wps)}): "
-                + "  ".join(f"({w['x']:.1f},{w['y']:.1f})" for w in valid_wps))
+            elapsed = time.time() - t0
+
+            rospy.loginfo(
+                "[vlm] LOCKED fixed waypoints in %.2fs. status=%s plan_type=%s reasoning='%s'",
+                elapsed,
+                status,
+                plan_type,
+                reasoning[:120],
+            )
+
+            rospy.loginfo(
+                "[vlm] Locked waypoints: %s",
+                " ".join(f"({w['x']:.1f},{w['y']:.1f})" for w in valid_wps),
+            )
 
         except json.JSONDecodeError as e:
-            self.get_logger().error(f"VLM JSON parse error: {e}")
+            rospy.logerr("[vlm] JSON parse error: %s", str(e))
+            self._publish_status("searching")
         except Exception as e:
-            self.get_logger().error(f"VLM inference error: {e}")
+            rospy.logerr("[vlm] Inference error: %s", str(e))
+            self._publish_status("searching")
         finally:
             self._vlm_running = False
 
 
-# ═══════════════════════════════════════════════════════════════
+def main():
+    VLMNode()
+    rospy.spin()
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = VLMNode()
+
+if __name__ == "__main__":
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
+        main()
+    except rospy.ROSInterruptException:
         pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
