@@ -18,7 +18,7 @@ User command → VLM (GPT-4o) → ENU waypoints → A* on LiDAR costmap → Stan
 | `lidar_bev_node` | `lidar_bev_node.py` | Builds LiDAR BEV image + `/vlm_costmap` OccupancyGrid at 5 Hz |
 | `vlm_node` | `vlm_node.py` | Queries GPT-4o with RGB + BEV images; outputs locked ENU waypoints |
 | Waypoint visualiser | `waypoint_viz.py` | Displays VLM waypoints in RViz |
-| `planner_node` | `planner_node.py` | A* on costmap → spline smooth → Stanley controller → `/ackermann_cmd` |
+| `planner_node` | `planner_node.py` | A* on costmap → Stanley controller → `/ackermann_cmd` |
 
 ---
 
