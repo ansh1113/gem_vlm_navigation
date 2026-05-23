@@ -4,6 +4,10 @@ This repository replaces standard static waypoint tracking with a dynamic, langu
 
 It utilizes a Vision-Language Model (GPT-4o) to identify physical targets from natural language commands, generates a dynamic BEV costmap from an Ouster LiDAR, calculates collision-free paths using kinematic A*, and executes the path directly via the vehicle's PACMod system.
 
+# Demo
+https://drive.google.com/file/d/1hyys7mZEofxt-i_umuBVRV_u26QL9Jn8/view?usp=sharing
+https://drive.google.com/file/d/1htV_sITShUnw7c4KM_CDd5hqNqXCuZVi/view?usp=sharing
+
 ## System Architecture
 * **lidar_bev_node:** Generates a top-down 2D occupancy grid and a visual rendering of the environment for the VLM.
 * **vlm_node:** Queries OpenAI with front RGB and top-down LiDAR images at 0.2Hz to parse natural language commands into ENU target coordinates.
